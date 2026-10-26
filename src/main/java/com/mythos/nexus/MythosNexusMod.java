@@ -40,6 +40,12 @@ public class MythosNexusMod {
         ClientRegistry.registerKeyBinding(KEY_MOUNT_HUMAN);
         MinecraftForge.EVENT_BUS.register(this);
         MinecraftForge.EVENT_BUS.register(com.mythos.nexus.session.BotStatusOverlay.get());
+        // 人物同步：每个会话自己的 tick 钩子里跑一次，主控发布快照、跟随者镜像。
+        com.mythos.nexus.session.SessionTicker.registerTickHook(() -> {
+            com.mythos.nexus.session.BotSession me =
+                    com.mythos.nexus.session.NexusCtx.current();
+            if (me != null) com.mythos.nexus.session.SyncEngine.tick(me);
+        });
         // Automation hook: -Dnexus.auto=host:port,user1,user2,...
         // When the title screen first appears, connect each listed account.
         String auto = System.getProperty("nexus.auto");
@@ -203,6 +209,31 @@ public class MythosNexusMod {
                 bot.username, bot.serverHost, bot.serverPort);
         mc.addScheduledTask(() -> BotConnection.connect(bot));
         ev.setGui(parent != null ? parent : new net.minecraft.client.gui.GuiMainMenu());
+    }
+
+    /**
+     * 人物同步的渲染前对齐：每帧一次，在世界 tick 之后、实体绘制之前，
+     * 把跟随者的远端实体压到源身上，消掉网络插值带来的「慢一步」。
+     */
+    @SubscribeEvent
+    public void onRenderTick(net.minecraftforge.fml.common.gameevent.TickEvent.RenderTickEvent ev) {
+        if (ev.phase != net.minecraftforge.fml.common.gameevent.TickEvent.Phase.START) return;
+        try { com.mythos.nexus.session.SyncEngine.clientFrame(); }
+        catch (Throwable t) { com.mythos.nexus.core.NexusRefs.warnOnce("sync:frame", t, "sync frame overlay failed"); }
+    }
+
+    /**
+     * 第一人称下不画与自己重叠的跟随者 —— 否则一大块玩家模型直接贴在镜头上。
+     */
+    @SubscribeEvent
+    public void onRenderPlayer(net.minecraftforge.client.event.RenderPlayerEvent.Pre ev) {
+        try {
+            if (com.mythos.nexus.session.SyncEngine.hideNearCamera(ev.getEntityPlayer())) {
+                ev.setCanceled(true);
+            }
+        } catch (Throwable t) {
+            com.mythos.nexus.core.NexusRefs.warnOnce("sync:hide", t, "sync first-person hide failed");
+        }
     }
 
     /** Poll for the title screen each tick to run -Dnexus.auto once. */

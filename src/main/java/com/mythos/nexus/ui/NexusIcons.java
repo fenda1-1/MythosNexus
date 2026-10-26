@@ -182,6 +182,20 @@ final class NexusIcons {
         Ui.fill(cx + 2, cy - 3, 2, 1, color);
     }
 
+    /** Sync icon — two figures standing shoulder to shoulder under a shared bar. */
+    static void iconSync(int cx, int cy, int color) {
+        Ui.fill(cx - 6, cy - 7, 12, 2, color);   // shared link bar
+        // left figure
+        Ui.fill(cx - 5, cy - 4, 3, 3, color);    // head
+        Ui.fill(cx - 5, cy, 3, 5, color);        // body
+        // right figure
+        Ui.fill(cx + 2, cy - 4, 3, 3, color);
+        Ui.fill(cx + 2, cy, 3, 5, color);
+        // the tie between them
+        Ui.fill(cx - 1, cy - 2, 2, 1, color);
+        Ui.fill(cx - 1, cy + 1, 2, 1, color);
+    }
+
     /** Info icon — "i" inside a ring. */    static void iconInfo(int cx, int cy, int color) {
         Ui.fill(cx - 3, cy - 7, 6, 1, color);
         Ui.fill(cx - 3, cy + 6, 6, 1, color);

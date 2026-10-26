@@ -55,7 +55,7 @@ public class NexusScreen extends GuiScreen {
     boolean draggingRight = false;
     float hoverAnimLeft = 0f, hoverAnimRight = 0f;
 
-    enum View { ACCOUNTS, RECONNECT, PROXIES, LOG, STATUS, THEME, TICKRATE, HELP, SCRIPTS, COMMANDS, INFO }
+    enum View { ACCOUNTS, RECONNECT, PROXIES, LOG, STATUS, THEME, TICKRATE, SYNC, HELP, SCRIPTS, COMMANDS, INFO }
     View view = View.ACCOUNTS;
 
     enum CardMode { WATERFALL, PAGE, LIVE }
@@ -121,6 +121,15 @@ public class NexusScreen extends GuiScreen {
     int rcEvScroll = 0;
     int rcEvThumbY, rcEvThumbH, rcEvTrackY, rcEvTrackH;
 
+    int syncScroll = 0;
+    int syncThumbY, syncThumbH, syncTrackY, syncTrackH;
+    int syncEvScroll = 0;
+    int syncEvThumbY, syncEvThumbH, syncEvTrackY, syncEvTrackH;
+
+    /** Icon-strip scroll offset in rows — small windows cannot fit every icon. */
+    int iconScroll = 0;
+    int iconThumbY, iconThumbH, iconTrackY, iconTrackH;
+
     /** level filter: null = all, else "INFO"/"WARN"/"ERROR". */
     String logFilter = null;
     int logScroll = 0;
@@ -162,6 +171,7 @@ public class NexusScreen extends GuiScreen {
     final NexusCenter center = new NexusCenter(this);
     final NexusAccountPanel rightAccounts = new NexusAccountPanel(this);
     final NexusReconnectPanel rightReconnect = new NexusReconnectPanel(this);
+    final NexusSyncPanel rightSync = new NexusSyncPanel(this);
     final NexusProxyPanel rightProxies = new NexusProxyPanel(this);
     final NexusLogPanel rightLog = new NexusLogPanel(this);
     final NexusStatusPanel rightStatus = new NexusStatusPanel(this);
@@ -654,6 +664,7 @@ public class NexusScreen extends GuiScreen {
                 case STATUS:   rightStatus.draw(rx, mx, my);   break;
                 case THEME:    rightTheme.draw(rx, mx, my);    break;
                 case TICKRATE: rightTickrate.draw(rx, mx, my); break;
+                case SYNC:     rightSync.draw(rx, mx, my);     break;
                 case HELP:     rightHelp.draw(rx, mx, my);     break;
                 case SCRIPTS:  rightScript.draw(rx, mx, my);   break;
                 case COMMANDS: rightCommands.draw(rx, mx, my); break;
@@ -679,58 +690,146 @@ public class NexusScreen extends GuiScreen {
         View.HELP,     "help",   "快捷键", "双击录制组合键",
         View.THEME,    "theme",  "主题",   "预设 / 新建 / 导入 / AI 生成",
         View.TICKRATE, "tick",   "Tick",   "自适应调度 · 优先级曲线",
+        View.SYNC,     "sync",   "人物同步","同步分组 · 聚拢 · 动作复制",
         View.INFO,     "info",   "信息",   "支持作者 · 交流群 · 开源",
     };
+
+    /** Rows the strip can show — every entry plus the settings icon. */
+    static final int ICON_ROW_H = 24;
+    static final int ICON_TOP = 40;
+    /** Reserved bottom band: the status bar owns the last strip of pixels. */
+    static final int ICON_BOTTOM_RESERVE = 26;
+    static final int ICON_SCROLL_W = 3;
+
+    static int iconRowCount() { return ICON_STRIP_DEFS.length / 4 + 1; }
+
+    /** Rows that fit between the first icon and the status bar. */
+    int iconVisibleRows() {
+        int avail = height - ICON_TOP - ICON_BOTTOM_RESERVE;
+        return Math.max(1, avail / ICON_ROW_H);
+    }
+
+    int iconMaxScroll() {
+        return Math.max(0, iconRowCount() - iconVisibleRows());
+    }
+
+    int iconStripX() { return width - 20; }
 
     /** Width of the editable panel region — always excludes the icon strip. */
     int panelW() { return rightCollapsed ? 0 : rightW - ICON_STRIP; }
 
-    /** Permanent icon strip on the far right; always visible, even collapsed. */
-    void drawRightIcons(int mx, int my) {
-        int iconX = width - 20, iconY = 40;
+    /**
+     * Walks the pinned entries in display order and reports the row (after the
+     * scroll offset) plus y the icon occupies. Settings is always last, is
+     * never pinnable off, and sits one separator gap below the rest — the
+     * index passed to the visitor for it is -1.
+     */
+    private interface IconVisitor { boolean visit(String iconId, View pv, String tipT, String tipS,
+                                                 int row, int y); }
+
+    private void forEachIcon(IconVisitor v) {
+        int scroll = Math.max(0, Math.min(iconScroll, iconMaxScroll()));
+        int row = 0;
+        boolean sepPending = false;
         Object[] strip = ICON_STRIP_DEFS;
         for (int i = 0; i < strip.length; i += 4) {
-            View pv = (View) strip[i];
             String ic = (String) strip[i + 1];
-            String tipT = (String) strip[i + 2];
-            String tipS = (String) strip[i + 3];
-            if (!NexusConfig.iconPinned(ic)) continue;   // hidden via 图标面板设置
-            boolean hov = hit(mx, my, iconX, iconY, 16, 20);
-            boolean active = view == pv && !(pv == View.ACCOUNTS && rightCollapsed);
-            if (hov) Ui.roundedRect(iconX, iconY, 16, 20, 3, NexusTheme.HOVER_WASH);
-            // collapsed && pv==view → panel is hidden: show dimmed (not accent)
-            int color = (active && !rightCollapsed) ? NexusTheme.ACCENT
-                    : (hov ? NexusTheme.TEXT_TITLE : NexusTheme.TEXT_SUB);
-            int cx = iconX + 8, cy = iconY + 10;
-            switch (ic) {
-                case "edit":   NexusIcons.iconEdit(cx, cy, color);   break;
-                case "reconnect": NexusIcons.iconReconnect(cx, cy, color); break;
-                case "status": NexusIcons.iconStatus(cx, cy, color); break;
-                case "log":    NexusIcons.iconLog(cx, cy, color);    break;
-                case "proxy":  NexusIcons.iconProxy(cx, cy, color);  break;
-                case "theme":  NexusIcons.iconTheme(cx, cy, color);  break;
-                case "tick":   NexusIcons.iconTickRate(cx, cy, color); break;
-                case "help":   NexusIcons.iconKeyboard(cx, cy, color); break;
-                case "script": NexusIcons.iconScript(cx, cy, color);   break;
-                case "cmd":    NexusIcons.iconCommand(cx, cy, color);  break;
-                case "info":   NexusIcons.iconInfo(cx, cy, color);     break;
-            }
-            if (hov) { hoverText = tipT + "\n" + tipS; hoverX = mx; hoverY = my; }
-            iconY += 24;
+            if (!NexusConfig.iconPinned(ic)) continue;
+            if (v.visit(ic, (View) strip[i], (String) strip[i + 2], (String) strip[i + 3],
+                    row++ - scroll, ICON_TOP + (row - 1 - scroll) * ICON_ROW_H)) return;
+            sepPending = true;
         }
-        iconY += 4;
-        Ui.divider(iconX - 2, iconY, 20);
-        iconY += 4;
-        // The settings icon is always pinned — unpinning it would lock the
-        // user out of the only path back into that overlay.
-        {
-            boolean hov = hit(mx, my, iconX, iconY, 16, 20);
-            if (hov) Ui.roundedRect(iconX, iconY, 16, 20, 3, NexusTheme.HOVER_WASH);
-            NexusIcons.iconSettings(iconX + 8, iconY + 10,
-                    hov ? NexusTheme.TEXT_TITLE : NexusTheme.TEXT_SUB);
-            if (hov) { hoverText = "设置\n面板开关 · 常规选项"; hoverX = mx; hoverY = my; }
-            iconY += 24;
+        if (sepPending) row++;
+        v.visit("settings", null, "设置", "面板开关 · 常规选项",
+                row - scroll, ICON_TOP + (row - scroll) * ICON_ROW_H);
+    }
+
+    /** Last visible row index — used for the scroll thumb geometry. */
+    private int iconLastVisibleRow() {
+        int scroll = Math.max(0, Math.min(iconScroll, iconMaxScroll()));
+        return Math.min(iconRowCount(), scroll + iconVisibleRows());
+    }
+
+    /** Permanent icon strip on the far right; always visible, even collapsed. */
+    void drawRightIcons(int mx, int my) {
+        final int iconX = iconStripX();
+        int maxScroll = iconMaxScroll();
+        iconScroll = Math.max(0, Math.min(iconScroll, maxScroll));
+
+        int clipH = iconVisibleRows() * ICON_ROW_H;
+        clipPush(iconX - 2, ICON_TOP - 4, ICON_STRIP, clipH + 4);
+        try {
+            forEachIcon((ic, pv, tipT, tipS, row, y) -> {
+                if (row < 0 || row >= iconVisibleRows()) return false;   // scrolled out
+                boolean hov = hit(mx, my, iconX, y, 16, 20);
+                boolean active = pv != null && view == pv && !(pv == View.ACCOUNTS && rightCollapsed);
+                if (hov) Ui.roundedRect(iconX, y, 16, 20, 3, NexusTheme.HOVER_WASH);
+                // collapsed && pv==view → panel is hidden: show dimmed (not accent)
+                int color = (active && !rightCollapsed) ? NexusTheme.ACCENT
+                        : (hov ? NexusTheme.TEXT_TITLE : NexusTheme.TEXT_SUB);
+                int cx = iconX + 8, cy = y + 10;
+                switch (ic) {
+                    case "edit":   NexusIcons.iconEdit(cx, cy, color);   break;
+                    case "reconnect": NexusIcons.iconReconnect(cx, cy, color); break;
+                    case "status": NexusIcons.iconStatus(cx, cy, color); break;
+                    case "log":    NexusIcons.iconLog(cx, cy, color);    break;
+                    case "proxy":  NexusIcons.iconProxy(cx, cy, color);  break;
+                    case "theme":  NexusIcons.iconTheme(cx, cy, color);  break;
+                    case "tick":   NexusIcons.iconTickRate(cx, cy, color); break;
+                    case "help":   NexusIcons.iconKeyboard(cx, cy, color); break;
+                    case "script": NexusIcons.iconScript(cx, cy, color);   break;
+                    case "cmd":    NexusIcons.iconCommand(cx, cy, color);  break;
+                    case "sync":   NexusIcons.iconSync(cx, cy, color);     break;
+                    case "info":   NexusIcons.iconInfo(cx, cy, color);     break;
+                    case "settings": NexusIcons.iconSettings(cx, cy, color); break;
+                }
+                if (hov) { hoverText = tipT + "\n" + tipS; hoverX = mx; hoverY = my; }
+                return false;
+            });
+        } finally {
+            clipPop();
         }
+
+        // Scrollbar — only when the strip actually overflows.
+        iconThumbH = 0;
+        if (maxScroll > 0) {
+            int trackY = ICON_TOP - 4, trackH = clipH + 4;
+            int rows = iconRowCount();
+            int thumbH = Math.max(14, trackH * iconVisibleRows() / rows);
+            int thumbY = trackY + (trackH - thumbH) * iconScroll / maxScroll;
+            int sx = width - ICON_SCROLL_W - 1;
+            iconTrackY = trackY; iconTrackH = trackH;
+            iconThumbY = thumbY; iconThumbH = thumbH;
+            Ui.fill(sx, trackY, ICON_SCROLL_W, trackH, NexusTheme.BG_CARD_HOV);
+            boolean thov = dragScroll == 7
+                    || hit(mx, my, sx - 2, thumbY - 2, ICON_SCROLL_W + 4, thumbH + 4);
+            Ui.fill(sx, thumbY, ICON_SCROLL_W, thumbH,
+                    thov ? NexusTheme.ACCENT : NexusTheme.BORDER_SOFT);
+        }
+    }
+
+    /** Icon under the cursor, or null. Uses the same row walk as the draw. */
+    private View iconAt(int mx, int my) {
+        final View[] found = {null};
+        forEachIcon((ic, pv, tipT, tipS, row, y) -> {
+            if (row < 0 || row >= iconVisibleRows()) return false;
+            if (hit(mx, my, iconStripX(), y, 16, 20)) { found[0] = pv == null ? View.INFO : pv;
+                settingsHit = pv == null; return true; }
+            return false;
+        });
+        return found[0];
+    }
+
+    /** Set by iconAt: true when the icon under the cursor is the settings one. */
+    private boolean settingsHit = false;
+
+    /** Wheel over the strip. Returns true when the strip consumed the scroll. */
+    boolean scrollIcons(int dWheel) {
+        int maxScroll = iconMaxScroll();
+        if (maxScroll <= 0) return false;
+        int dir = Integer.signum(dWheel);
+        iconScroll = Math.max(0, Math.min(maxScroll, iconScroll - dir));
+        return true;
     }
 
 
@@ -808,30 +907,31 @@ public class NexusScreen extends GuiScreen {
         // (width - rightW .. width - rightW + SPLIT_W) would otherwise sit
         // on top of the icons and eat every icon click as a "drag" press.
         {
-            int iconX = width - 20, iconY = 40;
-            for (int vi = 0; vi < ICON_STRIP_DEFS.length; vi += 4) {
-                View pv = (View) ICON_STRIP_DEFS[vi];
-                if (!NexusConfig.iconPinned((String) ICON_STRIP_DEFS[vi + 1])) continue;
-                if (hit(mx, my, iconX, iconY, 16, 20)) {
-                    if (pv == view && !rightCollapsed) {
-                        // Same icon while expanded → collapse (toggle off).
-                        rightCollapsed = true;
-                    } else {
-                        // Different icon, or collapsed → switch panel + expand.
-                        view = pv;
-                        rightCollapsed = false;
-                        if (rightW < rightW_MIN) rightW = 280;
-                    }
-                    fitColumns();
-                    relayout();
-                    return;
-                }
-                iconY += 24;
+            // The strip scrolls when the window is short; grab its thumb first
+            // so a press on it starts a drag instead of switching panels.
+            if (iconThumbH > 0 && hit(mx, my, iconStripX() + 4, iconThumbY - 2,
+                    ICON_SCROLL_W + 6, iconThumbH + 4)) {
+                dragScroll = 7;
+                dragOffY = my - iconThumbY;
+                return;
             }
-            iconY += 8;   // separator gap
-            // Always drawn — the settings icon must never be unpinnable.
-            if (hit(mx, my, iconX, iconY, 16, 20)) { overlayPanel = "settings"; return; }
-            iconY += 24;
+            settingsHit = false;
+            View iconHit = iconAt(mx, my);
+            if (iconHit != null) {
+                if (settingsHit) { overlayPanel = "settings"; return; }
+                if (iconHit == view && !rightCollapsed) {
+                    // Same icon while expanded → collapse (toggle off).
+                    rightCollapsed = true;
+                } else {
+                    // Different icon, or collapsed → switch panel + expand.
+                    view = iconHit;
+                    rightCollapsed = false;
+                    if (rightW < rightW_MIN) rightW = 280;
+                }
+                fitColumns();
+                relayout();
+                return;
+            }
         }
 
         if (isHoverLeftSplit(mx, my))  { draggingLeft = true;  return; }
@@ -849,6 +949,7 @@ public class NexusScreen extends GuiScreen {
                 case LOG:      if (rightLog.click(mx, my, btn))     return; break;
                 case THEME:    if (rightTheme.click(mx, my, btn))   return; break;
                 case TICKRATE: if (rightTickrate.click(mx, my, btn)) return; break;
+                case SYNC:     if (rightSync.click(mx, my, btn))     return; break;
                 case HELP:     if (rightHelp.click(mx, my, btn))     return; break;
                 case SCRIPTS:  if (rightScript.click(mx, my, btn))   return; break;
                 case COMMANDS: if (rightCommands.click(mx, my, btn)) return; break;
@@ -939,6 +1040,7 @@ public class NexusScreen extends GuiScreen {
         dragScroll = 0;
         rightProxies.release();
         rightAccounts.release(); rightStatus.release(); rightLog.release();
+        rightSync.release();
         super.mouseReleased(mx, my, state);
     }
 
@@ -980,6 +1082,13 @@ public class NexusScreen extends GuiScreen {
         } else {
             rail.drag(mx, my);
             center.drag(mx, my);
+            if (dragScroll == 7 && iconThumbH > 0 && iconTrackH > iconThumbH) {
+                int ty = Math.max(iconTrackY, Math.min(my - dragOffY,
+                        iconTrackY + iconTrackH - iconThumbH));
+                iconScroll = Math.max(0, Math.min(iconMaxScroll(),
+                        (ty - iconTrackY) * iconMaxScroll()
+                                / Math.max(1, iconTrackH - iconThumbH)));
+            }
             rightAccounts.drag(mx, my);
             rightReconnect.drag(mx, my);
             rightLog.drag(mx, my);
@@ -987,6 +1096,7 @@ public class NexusScreen extends GuiScreen {
             rightStatus.drag(mx, my);   // entity-list thumb (panel-local drag)
             rightTheme.drag(mx, my);
             rightTickrate.drag(mx, my);
+            rightSync.drag(mx, my);
             rightHelp.drag(mx, my);
             rightScript.drag(mx, my);
             rightCommands.drag(mx, my);
@@ -1093,6 +1203,7 @@ public class NexusScreen extends GuiScreen {
             int mx = Mouse.getEventX() * width / mc.displayWidth;
             int cx = railW + SPLIT_W;
             int rx = width - rightW;
+            if (mx >= width - ICON_STRIP && scrollIcons(d)) return;
             if (mx < railW) rail.scroll(d);
             else if (mx >= cx && mx < rx) center.scroll(d);
             else {
@@ -1104,6 +1215,7 @@ public class NexusScreen extends GuiScreen {
                     case PROXIES:  rightProxies.scroll(d);   break;
                     case THEME:    rightTheme.scroll(d);      break;
                     case TICKRATE: rightTickrate.scroll(d);   break;
+                    case SYNC:     rightSync.scroll(d);        break;
                     case HELP:     rightHelp.scroll(d);        break;
                     case SCRIPTS:  rightScript.scroll(d);      break;
                     case INFO:     rightInfo.scroll(d);        break;

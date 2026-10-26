@@ -27,6 +27,7 @@ final class SettingsOverlay implements NexusOverlay {
         {"help",   "快捷键", "双击录制组合键"},
         {"theme",  "主题", "预设 / 新建 / 导入 / AI 生成"},
         {"tick",   "Tick", "自适应调度 · 优先级曲线"},
+        {"sync",   "人物同步", "同步分组 · 聚拢 · 动作复制"},
         {"info",   "信息", "支持作者 · 交流群 · 开源"},
     };
     private static final int H = LIST_TOP + ITEMS.length * ROW_STEP + 28;

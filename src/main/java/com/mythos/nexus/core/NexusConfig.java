@@ -124,6 +124,29 @@ public final class NexusConfig {
         java.util.List<CustomTheme> customThemes = new java.util.ArrayList<>();
         /** Empty groups the user created — kept even while no account uses them. */
         java.util.List<String> extraGroups = new java.util.ArrayList<>();
+        /** 人物同步分组 — user-built groups of accounts kept in lock-step. */
+        java.util.List<SyncGroup> syncGroups = new java.util.ArrayList<>();
+        /** 聚拢半径（格）— beyond this the followers stop mirroring and path
+         *  toward the leader instead. */
+        float syncGatherRange = 10f;
+        /** 开启同步时自动把落后的 bot 寻路到主控身边。 */
+        boolean syncAutoGather = true;
+    }
+
+    /**
+     * 一个同步分组：成员之间攻击 / 移动 / 视角完全一致。
+     * 组内第一台在线的是主控（leader），其余跟随。
+     */
+    public static class SyncGroup {
+        public String name = "同步组";
+        public boolean enabled = false;
+        /** Account keys ("username@host:port"), in join order. */
+        public java.util.List<String> members = new java.util.ArrayList<>();
+        /** Seconds a follower keeps mirroring after the leader stops moving. */
+        public int holdSeconds = 3;
+
+        public SyncGroup() {}
+        public SyncGroup(String name) { this.name = name; }
     }
 
     /** A user-defined theme that lives next to the built-in presets. */
@@ -155,6 +178,14 @@ public final class NexusConfig {
             if (root.accounts == null) root.accounts = new ArrayList<>();
             if (root.customThemes == null) root.customThemes = new java.util.ArrayList<>();
             if (root.extraGroups == null) root.extraGroups = new java.util.ArrayList<>();
+            if (root.syncGroups == null) root.syncGroups = new java.util.ArrayList<>();
+            root.syncGroups.removeIf(g -> g == null);
+            for (SyncGroup g : root.syncGroups) {
+                if (g.name == null || g.name.isEmpty()) g.name = "同步组";
+                if (g.members == null) g.members = new java.util.ArrayList<>();
+                g.members.removeIf(k -> k == null || k.isEmpty());
+                g.holdSeconds = Math.max(0, Math.min(60, g.holdSeconds));
+            }
             root.accounts.removeIf(a -> a == null || a.username == null || a.username.isEmpty()
                     || a.host == null || a.host.isEmpty());
         }
@@ -626,5 +657,114 @@ public final class NexusConfig {
         java.util.List<String> g = root().extraGroups;
         int i = g.indexOf(oldName);
         if (i >= 0) { g.set(i, newName); save(); }
+    }
+
+
+    // ---- 人物同步分组 ------------------------------------------------------
+
+    public static synchronized java.util.List<SyncGroup> syncGroups() {
+        java.util.List<SyncGroup> out = new java.util.ArrayList<>();
+        for (SyncGroup g : root().syncGroups) out.add(copyOf(g));
+        return out;
+    }
+
+    /** Defensive copy — callers iterate this off the client thread. */
+    private static SyncGroup copyOf(SyncGroup g) {
+        SyncGroup c = new SyncGroup(g.name);
+        c.enabled = g.enabled;
+        c.members = new java.util.ArrayList<>(g.members);
+        c.holdSeconds = g.holdSeconds;
+        return c;
+    }
+
+    public static synchronized SyncGroup syncGroup(String name) {
+        for (SyncGroup g : root().syncGroups)
+            if (g.name.equals(name)) return copyOf(g);
+        return null;
+    }
+
+    /** Create a group; returns false when the name is taken. */
+    public static synchronized boolean addSyncGroup(String name) {
+        if (name == null || name.trim().isEmpty()) return false;
+        String n = name.trim();
+        for (SyncGroup g : root().syncGroups) if (g.name.equalsIgnoreCase(n)) return false;
+        root().syncGroups.add(new SyncGroup(n));
+        saveNow();
+        return true;
+    }
+
+    public static synchronized void removeSyncGroup(String name) {
+        boolean removed = root().syncGroups.removeIf(g -> g.name.equals(name));
+        if (removed) saveNow();
+    }
+
+    public static synchronized void renameSyncGroup(String oldName, String newName) {
+        if (newName == null || newName.trim().isEmpty()) return;
+        String n = newName.trim();
+        for (SyncGroup g : root().syncGroups) {
+            if (g.name.equals(oldName)) { g.name = n; saveNow(); return; }
+        }
+    }
+
+    public static synchronized void setSyncGroupEnabled(String name, boolean on) {
+        for (SyncGroup g : root().syncGroups)
+            if (g.name.equals(name)) { g.enabled = on; saveNow(); return; }
+    }
+
+    public static synchronized void setSyncHoldSeconds(String name, int sec) {
+        for (SyncGroup g : root().syncGroups)
+            if (g.name.equals(name)) {
+                g.holdSeconds = Math.max(0, Math.min(60, sec)); save(); return;
+            }
+    }
+
+    /** Add accounts to a group; an account lives in at most one group. */
+    public static synchronized void syncAddMembers(String name, java.util.List<String> keys) {
+        SyncGroup target = null;
+        for (SyncGroup g : root().syncGroups) if (g.name.equals(name)) target = g;
+        if (target == null) return;
+        for (String k : keys) {
+            if (k == null || k.isEmpty() || target.members.contains(k)) continue;
+            for (SyncGroup g : root().syncGroups)
+                if (g != target) g.members.remove(k);
+            target.members.add(k);
+        }
+        saveNow();
+    }
+
+    public static synchronized void syncRemoveMember(String name, String key) {
+        for (SyncGroup g : root().syncGroups)
+            if (g.name.equals(name) && g.members.remove(key)) { saveNow(); return; }
+    }
+
+    /** Group an account belongs to, or null. */
+    public static synchronized String syncGroupOf(String key) {
+        for (SyncGroup g : root().syncGroups)
+            if (g.members.contains(key)) return g.name;
+        return null;
+    }
+
+    /** Every enabled group — the sync engine polls this each tick. */
+    public static synchronized java.util.List<SyncGroup> enabledSyncGroups() {
+        java.util.List<SyncGroup> out = new java.util.ArrayList<>();
+        for (SyncGroup g : root().syncGroups) if (g.enabled) out.add(copyOf(g));
+        return out;
+    }
+
+    /** {enabled, total} over every group — drives the master switch label. */
+    public static synchronized int[] syncGroupStats() {
+        int on = 0, total = 0;
+        for (SyncGroup g : root().syncGroups) { total++; if (g.enabled) on++; }
+        return new int[]{on, total};
+    }
+
+    /** Gather radius in blocks — followers outside it path toward the leader. */
+    public static synchronized float syncGatherRange() { return root().syncGatherRange; }
+    public static synchronized void setSyncGatherRange(float r) {
+        root().syncGatherRange = Math.max(2f, Math.min(64f, r)); save();
+    }
+    public static synchronized boolean syncAutoGather() { return root().syncAutoGather; }
+    public static synchronized void setSyncAutoGather(boolean on) {
+        root().syncAutoGather = on; save();
     }
 }

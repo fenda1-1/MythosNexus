@@ -138,6 +138,12 @@ final class BotTicker implements Runnable {
         ctx.tickRateAcc += pct;
         boolean runFullTick = ctx.tickRateAcc >= 100;
         if (runFullTick) ctx.tickRateAcc -= 100;
+        // 被同步的从属必须每 tick 都跑：自适应节流会把它降到 20%，位置就变成
+        // 每 6 tick 才对齐一次，看上去正是「源先动、它过一会儿才跟上」。
+        if (!runFullTick && SyncEngine.isSynced(ctx)) {
+            runFullTick = true;
+            ctx.tickRateAcc = 0;
+        }
 
         for (Runnable hook : SessionTicker.FAST_HOOKS) hook.run();
 

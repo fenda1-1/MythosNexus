@@ -310,6 +310,87 @@ public final class NexusHooks {
     }
 
     /**
+     * RenderManager.renderEntity 头部守卫：保证 renderViewEntity 非 null。
+     * 为 null 时用 mc.getRenderViewEntity() 填回，填不上就跳过本次实体渲染。
+     *
+     * @return true 表示调用方应直接 return
+     */
+    public static boolean renderViewEntityGuard(Object renderManager) {
+        if (renderManager == null) return false;
+        java.lang.reflect.Field f = renderViewField(renderManager.getClass());
+        if (f == null) return false;
+        try {
+            if (f.get(renderManager) != null) return false;
+            net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getMinecraft();
+            net.minecraft.entity.Entity fix = mc == null ? null : mc.getRenderViewEntity();
+            if (fix == null) {
+                logViewFill("renderEntity 阶段 renderViewEntity 为空且无可补，跳过该实体");
+                return true;
+            }
+            f.set(renderManager, fix);
+            logViewFill("renderEntity 阶段 renderViewEntity 为空，已补齐");
+            return false;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    private static volatile boolean viewFillLogged;
+
+    private static void logViewFill(String what) {
+        if (viewFillLogged) return;
+        viewFillLogged = true;
+        NexusPlugin.LOGGER.info("[guard] {}", what);
+    }
+
+    private static volatile java.lang.reflect.Field RM_VIEW_FIELD;
+
+    /**
+     * RenderManager.renderViewEntity 在 obf / srg / mcp 三种状态下名字都不同，
+     * 先按已知名字找，再按「这个类里唯一的 Entity 类型字段」兜底 —— 不能靠名字
+     * 硬编码，否则换映射就静默失效。
+     */
+    private static java.lang.reflect.Field renderViewField(Class<?> rmClass) {
+        java.lang.reflect.Field cached = RM_VIEW_FIELD;
+        if (cached != null && cached.getDeclaringClass() == rmClass) return cached;
+        for (String n : new String[]{"field_78734_h", "renderViewEntity"}) {
+            try {
+                java.lang.reflect.Field c = rmClass.getDeclaredField(n);
+                c.setAccessible(true);
+                RM_VIEW_FIELD = c;
+                return c;
+            } catch (Throwable ignored) {
+            }
+        }
+        for (java.lang.reflect.Field c : rmClass.getDeclaredFields()) {
+            if (c.getType() == net.minecraft.entity.Entity.class) {
+                try { c.setAccessible(true); } catch (Throwable ignored) { }
+                RM_VIEW_FIELD = c;
+                return c;
+            }
+        }
+        return null;
+    }
+
+    /** 每帧把 RenderManager.renderViewEntity 补上；已非 null 或无可补时不动。 */
+    public static void fillRenderViewEntity() {
+        try {
+            net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getMinecraft();
+            if (mc == null) return;
+            net.minecraft.entity.Entity view = mc.getRenderViewEntity();
+            if (view == null) return;
+            Object rm = mc.getRenderManager();
+            if (rm == null) return;
+            java.lang.reflect.Field f = renderViewField(rm.getClass());
+            if (f != null && f.get(rm) == null) {
+                f.set(rm, view);
+                logViewFill("每帧补帧阶段 renderViewEntity 为空，已补齐");
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
      * EntityRenderer calls IntegratedServer.is...() from its render loop even
      * for a normal multiplayer client, where getIntegratedServer() is null.
      * Keep that vanilla probe harmless and preserve the branch's intent:
@@ -405,7 +486,8 @@ public final class NexusHooks {
 
     public static boolean tickGuard(Object thisObj) {
         // thisObj is Minecraft for the tick handlers, McpGameService for
-        // McpGameService.tick. Resolve Minecraft either way.
+        // McpGameService.tick, EntityRenderer for updateRenderer. Resolve
+        // Minecraft either way.
         Minecraft mc;
         if (thisObj instanceof Minecraft) {
             mc = (Minecraft) thisObj;
@@ -413,8 +495,18 @@ public final class NexusHooks {
             mc = resolveMinecraft();
             if (mc == null) return true; // can't resolve → skip tick, safe
         }
-        return mc.player == null || mc.world == null;
+        if (mc.player != null && mc.world != null) return false;
+        if (!tickSkipLogged) {
+            tickSkipLogged = true;
+            StackTraceElement[] st = Thread.currentThread().getStackTrace();
+            NexusPlugin.LOGGER.info("[guard] tick 跳过 player={} world={} caller={}",
+                    mc.player != null, mc.world != null,
+                    st.length > 2 ? st[2].getClassName() : "?");
+        }
+        return true;
     }
+
+    private static volatile boolean tickSkipLogged;
 
     // Two probes: (a) client-thread heartbeat via runSessionTicks (already
     // injected at runTick head, fires every vanilla tick ~20Hz); (b) a daemon

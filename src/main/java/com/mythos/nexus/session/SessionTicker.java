@@ -72,6 +72,18 @@ public final class SessionTicker {
      */
     public static void run() {
         PacketPump.pump(); // drain packet queue first — before session ticks
+        // 发布人物同步的源快照。
+        try {
+            SyncEngine.clientTick();
+        } catch (Throwable t) {
+            com.mythos.nexus.core.NexusPlugin.LOGGER.warn("sync source tick failed", t);
+        }
+        // 数据包级同步：把主控发出的动作包重放到同组账号的连接上。
+        try {
+            PacketSync.tick();
+        } catch (Throwable t) {
+            com.mythos.nexus.core.NexusPlugin.LOGGER.warn("packet sync tick failed", t);
+        }
         SessionManager mgr = SessionManager.get();
         // Persist the online set whenever it changes so a JVM restart can
         // re-add + reconnect the same multi-box roster.
@@ -247,5 +259,67 @@ public final class SessionTicker {
 
     private static Class<?> findClass(String mcp, String obf) throws ClassNotFoundException {
         try { return Class.forName(mcp); } catch (ClassNotFoundException e) { return Class.forName(obf); }
+    }
+
+    /**
+     * 让某个会话寻路到方块坐标。优先走 Baritone（同一个 IBaritone 实例，
+     * 与其余寻路功能共享状态），拿不到 Baritone 时返回 false，由调用方
+     * 自行退化成直线靠近。
+     *
+     * 反射是因为 Mythos-Nexus 与 MythosScript/Baritone 分属不同 jar，
+     * 编译期没有依赖。
+     */
+    public static boolean sendGoto(BotSession s, int x, int y, int z) {
+        Object bar = baritone(s);
+        if (bar == null) return false;
+        try {
+            Object pb = bar.getClass().getMethod("getCustomGoalProcess").invoke(bar);
+            if (pb == null) return false;
+            // setGoalAndPath(Goal) — Goal is built reflectively because its
+            // concrete type (GoalBlock) is Baritone's, not ours.
+            Class<?> goalBlock = NexusRefs.cls("baritone.api.pathing.goals.GoalBlock");
+            Object goal = goalBlock.getConstructor(int.class, int.class, int.class)
+                    .newInstance(x, y, z);
+            for (java.lang.reflect.Method m : pb.getClass().getMethods()) {
+                if (!"setGoalAndPath".equals(m.getName())) continue;
+                Class<?>[] ps = m.getParameterTypes();
+                if (ps.length != 1) continue;
+                m.invoke(pb, goal);
+                return true;
+            }
+            return false;
+        } catch (Throwable t) {
+            NexusRefs.warnOnce("ticker:sendGoto", t, "SessionTicker.sendGoto failed");
+            return false;
+        }
+    }
+
+    /** 取消该会话当前的寻路（同步引擎切回镜像时调用）。 */
+    public static void sendStop(BotSession s) {
+        Object bar = baritone(s);
+        if (bar == null) return;
+        try {
+            Object pb = bar.getClass().getMethod("getPathingBehavior").invoke(bar);
+            if (pb != null) {
+                for (java.lang.reflect.Method m : pb.getClass().getMethods()) {
+                    if (!"cancelEverything".equals(m.getName())) continue;
+                    if (m.getParameterTypes().length != 0) continue;
+                    m.invoke(pb);
+                    break;
+                }
+            }
+        } catch (Throwable t) {
+            NexusRefs.warnOnce("ticker:sendStop", t, "SessionTicker.sendStop failed");
+        }
+    }
+
+    /** Cached-or-resolved IBaritone for this session. */
+    private static Object baritone(BotSession s) {
+        Object bar = s.baritone;
+        if (bar == null) {
+            bar = resolveBaritone(s);
+            if (bar != null) s.baritone = bar;
+        }
+        return bar;
     }
 }

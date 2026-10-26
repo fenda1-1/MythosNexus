@@ -168,6 +168,8 @@ final class NexusCommands {
                 s -> s.showView(NexusScreen.View.ACCOUNTS), alt(Keyboard.KEY_1)));
         l.add(new Cmd("view.reconnect", "打开自动重连面板", "面板", "队列 · 随机间隔 · 统一开关",
                 s -> s.showView(NexusScreen.View.RECONNECT), alt(Keyboard.KEY_R)));
+        l.add(new Cmd("view.sync", "打开人物同步面板", "面板", "同步分组 · 聚拢 · 动作复制",
+                s -> s.showView(NexusScreen.View.SYNC), alt(Keyboard.KEY_Y)));
         l.add(new Cmd("view.status", "打开状态面板", "面板", "在线时长 · HP · 附近实体",
                 s -> s.showView(NexusScreen.View.STATUS), alt(Keyboard.KEY_2)));
         l.add(new Cmd("view.log", "打开日志面板", "面板", "会话事件日志",

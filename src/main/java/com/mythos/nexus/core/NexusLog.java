@@ -105,7 +105,8 @@ public final class NexusLog {
             FileOutputStream out = new FileOutputStream(
                     new File(DIR, channel + ".log"), true);
             STREAMS.put(channel, out);
-            return new PrintWriter(out, true);
+            // 固定 UTF-8：平台默认编码写出来的中文在别的工具里是乱码，日志就没法查了。
+            return new PrintWriter(new java.io.OutputStreamWriter(out, java.nio.charset.StandardCharsets.UTF_8), true);
         } catch (Throwable t) {
             t.printStackTrace(); // visible in launch.log even if log4j isn't up
             // last resort: a writer that swallows everything
@@ -114,6 +115,18 @@ public final class NexusLog {
     }
 
     private static String fmt(String fmt, Object... a) {
-        return a == null || a.length == 0 ? fmt : String.format(fmt, a);
+        if (a == null || a.length == 0) return fmt;
+        if (fmt.contains("{}")) {
+            StringBuilder sb = new StringBuilder(fmt.length() + 32);
+            int at = 0;
+            for (int i = 0; i < a.length; i++) {
+                int hit = fmt.indexOf("{}", at);
+                if (hit < 0) break;
+                sb.append(fmt, at, hit).append(String.valueOf(a[i]));
+                at = hit + 2;
+            }
+            return sb.append(fmt, at, fmt.length()).toString();
+        }
+        return String.format(fmt, a);
     }
 }

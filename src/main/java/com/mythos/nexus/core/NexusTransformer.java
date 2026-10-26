@@ -46,6 +46,7 @@ public class NexusTransformer implements IClassTransformer {
     private static final String TESS_CLASS = "net.minecraft.client.renderer.Tessellator";
     private static final String WVBU_CLASS = "net.minecraft.client.renderer.WorldVertexBufferUploader";
     private static final String EPSP_CLASS = "net.minecraft.client.entity.EntityPlayerSP";
+    private static final String RM_CLASS   = "net.minecraft.client.renderer.entity.RenderManager";
     private static final String HOOKS = "com/mythos/nexus/core/NexusHooks";
     private static final String HOOKS_INTERNAL = HOOKS.replace('.', '/');
 
@@ -97,6 +98,10 @@ public class NexusTransformer implements IClassTransformer {
             if (ER_CLASS.equals(transformedName) || "buq".equals(name)) {
                 NexusPlugin.LOGGER.info("[xform] EntityRenderer name={} transformedName={}", name, transformedName);
                 return pipeGetInstance(transformEntityRenderer(basicClass));
+            }
+            // RenderManager.renderEntity 头部守卫：保证 renderViewEntity 非 null。
+            if (RM_CLASS.equals(transformedName) || "bzf".equals(name)) {
+                return pipeGetInstance(transformRenderManager(basicClass));
             }
             if (PM_CLASS.equals(transformedName) || "btg".equals(name)) {
                 return pipeGetInstance(transformParticleManager(basicClass));
@@ -155,6 +160,16 @@ public class NexusTransformer implements IClassTransformer {
                 byte[] out = transformEntityPlayerSP(basicClass);
                 return pipeGetInstance(out != null ? out : basicClass);
             }
+            if (ENTITY_CLASS.equals(transformedName) || ENTITY_CLASS.equals(name)) {
+                return pipeGetInstance(transformEntity(basicClass, true));
+            }
+            // 子类如果覆写了 canBeCollidedWith，父类上的注入就不会生效，所以
+            // 这条链上定义过它的类都要打一遍。
+            if (ENTITY_LIVING_CLASS.equals(transformedName) || ENTITY_LIVING_CLASS.equals(name)
+                    || ENTITY_PLAYER_CLASS.equals(transformedName)
+                    || ENTITY_PLAYER_CLASS.equals(name)) {
+                return pipeGetInstance(transformEntity(basicClass, false));
+            }
             // Tick-reachable field-context rewrite: every class that a bot's
             // dedicated tick thread can reach and that reads/writes the 7
             // per-session mc fields gets its GETFIELD/PUTFIELD swapped for
@@ -204,6 +219,14 @@ public class NexusTransformer implements IClassTransformer {
 
     private static final String CTX_INTERNAL =
             "com/mythos/nexus/session/NexusCtx";
+
+    /** Static entry point for the no-push guard injected into Entity. */
+    private static final String SYNC_INTERNAL =
+            "com/mythos/nexus/session/SyncHooks";
+
+    private static final String ENTITY_CLASS = "net.minecraft.entity.Entity";
+    private static final String ENTITY_LIVING_CLASS = "net.minecraft.entity.EntityLivingBase";
+    private static final String ENTITY_PLAYER_CLASS = "net.minecraft.entity.player.EntityPlayer";
 
     /**
      * Classes whose GETFIELD/PUTFIELD on the 7 fields is rewritten.
@@ -1028,8 +1051,9 @@ public class NexusTransformer implements IClassTransformer {
                         @Override
                         public void visitCode() {
                             super.visitCode();
+                            mv.visitVarInsn(Opcodes.ALOAD, 0);          // this (EntityRenderer)
                             mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
-                                    "tickGuard", "()Z", false);
+                                    "tickGuard", "(Ljava/lang/Object;)Z", false);
                             Label cont = new Label();
                             mv.visitJumpInsn(Opcodes.IFEQ, cont);
                             mv.visitInsn(Opcodes.RETURN);
@@ -1100,6 +1124,10 @@ public class NexusTransformer implements IClassTransformer {
                             mv.visitJumpInsn(Opcodes.IFEQ, cont);
                             mv.visitInsn(Opcodes.RETURN);
                             mv.visitLabel(cont);
+                            // 每帧开头补一次 RenderManager.renderViewEntity，
+                            // 已非 null 时只做一次反射读。
+                            mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                                    "fillRenderViewEntity", "()V", false);
                         }
 
                         @Override
@@ -1557,6 +1585,46 @@ public class NexusTransformer implements IClassTransformer {
         return patched[0] ? cw.toByteArray() : in;
     }
 
+    /**
+     * RenderManager: head-guard `renderEntity` (func_188391_a, obf
+     * a(Entity,DDDFFZ)V) — 实体渲染的唯一入口，vanilla 的 renderEntityStatic
+     * 和外部 mod 都走这里，注入一处即可覆盖两条路径。
+     */
+    private byte[] transformRenderManager(byte[] in) {
+        ClassReader cr = new ClassReader(in);
+        ClassWriter cw = writer(cr);
+        final boolean[] patched = {false};
+        cr.accept(new ClassVisitor(Opcodes.ASM5, cw) {
+            @Override
+            public MethodVisitor visitMethod(int access, String mname, String mdesc,
+                                             String sig, String[] ex) {
+                MethodVisitor mv = super.visitMethod(access, mname, mdesc, sig, ex);
+                // 描述符是唯一稳定的锚点：obf 下方法名就是 a/b/c，名字不可靠。
+                boolean isRenderEntity = ("(Lnet/minecraft/entity/Entity;DDDFFZ)V".equals(mdesc)
+                        || "(Lvg;DDDFFZ)V".equals(mdesc))
+                        && (mname.equals("renderEntity") || mname.equals("func_188391_a") || mname.equals("a"));
+                if (!isRenderEntity) return mv;
+                patched[0] = true;
+                return new MethodVisitor(Opcodes.ASM5, mv) {
+                    @Override
+                    public void visitCode() {
+                        super.visitCode();
+                        mv.visitVarInsn(Opcodes.ALOAD, 0);          // this (RenderManager)
+                        mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                                "renderViewEntityGuard", "(Ljava/lang/Object;)Z", false);
+                        Label cont = new Label();
+                        mv.visitJumpInsn(Opcodes.IFEQ, cont);
+                        mv.visitInsn(Opcodes.RETURN);
+                        mv.visitLabel(cont);
+                    }
+                };
+            }
+        }, 0);
+        if (!patched[0]) NexusPlugin.LOGGER.warn("RenderManager.renderEntity not patched");
+        else NexusPlugin.LOGGER.info("[xform] RenderManager.renderEntity guarded");
+        return patched[0] ? cw.toByteArray() : in;
+    }
+
     // Background-thread GL / shared-singleton no-op guards.
     //
     // Each entry is a (mcp, srg, obf) name triple plus the method descriptor.
@@ -1667,6 +1735,69 @@ public class NexusTransformer implements IClassTransformer {
         }, 0);
         if (patched[0] > 0) {
             NexusPlugin.LOGGER.info("[xform] {} botNoop methods patched={}", tag, patched[0]);
+        }
+        return patched[0] > 0 ? cw.toByteArray() : in;
+    }
+
+    /**
+     * Entity: no-push guard for 人物同步. Two accounts stacked on the same
+     * block would otherwise shove each other apart every tick, which is the
+     * single most visible tell that they are separate players.
+     *
+     * canBePushed()  → push a `false` return when the group is stacked.
+     * collideWithNearbyEntities() → skip the whole push resolution.
+     *
+     * The decision is a pure lookup (SyncHooks.noPush), so this costs one
+     * static call per query when nothing is synced.
+     */
+    private byte[] transformEntity(byte[] in, boolean pushTargets) {
+        ClassReader cr = new ClassReader(in);
+        ClassWriter cw = writer(cr);
+        final int[] patched = {0};
+        final boolean withPush = pushTargets;
+        cr.accept(new ClassVisitor(Opcodes.ASM5, cw) {
+            @Override
+            public MethodVisitor visitMethod(int access, String mname, String mdesc,
+                                             String sig, String[] ex) {
+                MethodVisitor mv = super.visitMethod(access, mname, mdesc, sig, ex);
+                boolean canPush = withPush && mdesc.equals("()Z")
+                        && (mname.equals("canBePushed") || mname.equals("func_70104_M")
+                            || mname.equals("M"));
+                boolean collide = withPush && mdesc.equals("()V")
+                        && (mname.equals("collideWithNearbyEntities")
+                            || mname.equals("func_82167_n") || mname.equals("n"));
+                // 同步跟随者贴在主控身上，如果还能被选中，左键打面前的怪会先落到
+                // 自己人身上；还能参与碰撞就会互相挤。让它不可被碰撞/选中。
+                boolean pickable = mdesc.equals("()Z")
+                        && (mname.equals("canBeCollidedWith") || mname.equals("func_70067_L"));
+                if (!canPush && !collide && !pickable) return mv;
+                patched[0]++;
+                return new MethodVisitor(Opcodes.ASM5, mv) {
+                    @Override public void visitCode() {
+                        super.visitCode();
+                        mv.visitVarInsn(Opcodes.ALOAD, 0);
+                        if (pickable) {
+                            mv.visitMethodInsn(Opcodes.INVOKESTATIC, SYNC_INTERNAL,
+                                    "noCollide", "(Ljava/lang/Object;)Z", false);
+                        } else {
+                            mv.visitMethodInsn(Opcodes.INVOKESTATIC, SYNC_INTERNAL,
+                                    "noPush", "(Lnet/minecraft/entity/Entity;)Z", false);
+                        }
+                        Label cont = new Label();
+                        mv.visitJumpInsn(Opcodes.IFEQ, cont);
+                        if (canPush || pickable) {
+                            mv.visitInsn(Opcodes.ICONST_0);
+                            mv.visitInsn(Opcodes.IRETURN);
+                        } else {
+                            mv.visitInsn(Opcodes.RETURN);
+                        }
+                        mv.visitLabel(cont);
+                    }
+                };
+            }
+        }, 0);
+        if (patched[0] > 0) {
+            NexusPlugin.LOGGER.info("[xform] {} sync guards patched={}", cr.getClassName(), patched[0]);
         }
         return patched[0] > 0 ? cw.toByteArray() : in;
     }
