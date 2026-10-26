@@ -1,0 +1,38 @@
+.gradle/
+build/
+*.log
+*.class
+*.jar
+*.gz
+screen*.png
+# The forge container is a local test sandbox — game runtime, launch scripts
+# and logs never belong in the repo.
+container/
+
+# MCP JSON-RPC response dumps and codegraph's local settings: scratch files,
+# never part of the mod.
+/ka.json
+/st8.json
+/stn2.json
+/codegraph.json
+
+# Root-level build leftovers — the real resources live under src/main/resources.
+META-INF/
+/mcmod.info
+
+tools
+
+# CodeGraph's per-machine index — database, daemon log, pid, sockets.
+.codegraph/
+
+__pycache__/
+workspace/
+
+# Local audit notes from the session that built this mod — scratch, not docs.
+_nexus_read/
+
+# 手绘 Excalidraw 场景源文件与渲染图：纯本地设计产物，不进仓库
+.exc/
+
+# 本地验证脚本与探测产物：只在开发机上跑，别人克隆后用不到
+verification/
