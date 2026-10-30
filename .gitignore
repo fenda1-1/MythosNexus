@@ -36,3 +36,6 @@ _nexus_read/
 
 # 本地验证脚本与探测产物：只在开发机上跑，别人克隆后用不到
 verification/
+
+# dist/ 是发布用的预编译包，上面的 *.jar 全局忽略对它不生效
+!dist/*.jar

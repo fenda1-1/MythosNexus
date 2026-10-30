@@ -9,6 +9,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.network.NetHandlerPlayClient;
 import net.minecraft.network.NetworkManager;
 import net.minecraft.network.Packet;
+import net.minecraft.client.network.NetworkPlayerInfo;
 
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -16,12 +17,6 @@ import java.util.concurrent.atomic.AtomicLong;
  * Static entry points called from transformed bytecode. Kept dependency-free
  * (Object params) so the transformer never drags client classes into the
  * coremod classloader early.
- *
- * The packet queue and per-session tick pump live in
- * {@link com.mythos.nexus.session.PacketPump} and
- * {@link com.mythos.nexus.session.SessionTicker} — this class is the thin
- * ASM-entry shell (onPacketRead, guards, disconnect ctx, watchdog) that
- * delegates to them.
  */
 public final class NexusHooks {
 
@@ -110,6 +105,52 @@ public final class NexusHooks {
             }
         } catch (Throwable ignored) {}
         return true;
+    }
+
+    /**
+     * Head guard on every GlStateManager method (and on its inner state
+     * classes). The client thread owns the single GL context; a call from any
+     * other thread (bot ticker, netty IO, a mod's timer) throws
+     * "No OpenGL context found in the current thread" / "No context is
+     * current" — hard-crashing whatever happened to make the call, and it also
+     * scribbles on the cached GL state the client thread is using.
+     * Returning the return type's default is the only correct behaviour there:
+     * there is no context to change and the client thread's own cached state
+     * stays intact. Client-thread calls are byte-for-byte unchanged.
+     */
+    public static boolean glCallGuard() {
+        if (offClientThread()) return true;
+        // Before heartbeat() has run there is no recorded client thread yet, so
+        // offClientThread() cannot tell. The one thread we can still identify is
+        // a thread bound to a bot session — never the GL owner.
+        return clientThreadRef == null && com.mythos.nexus.session.NexusCtx.onBotThread();
+    }
+
+    /**
+     * Replacement for NetHandlerPlayClient.getPlayerInfo(UUID) *inside
+     * handleSpawnPlayer only*. Vanilla dereferences the result
+     * unconditionally — `getPlayerInfo(packet.getUniqueId()).getGameProfile()`
+     * — so a missing player-list entry NPEs at NetHandlerPlayClient.java:502
+     * and the whole spawn packet is lost: the player stays invisible and every
+     * later SPacketEntity* for that entity id is dropped as "unknown entity".
+     * The entry is legitimately missing when SPacketPlayerListItem arrives after
+     * the spawn packet, or after a REMOVE_PLAYER for the same uuid (dimension
+     * change / respawn race).
+     * Handing vanilla a placeholder NetworkPlayerInfo built from the packet's
+     * own UUID keeps the exact vanilla code path: the entity is created and
+     * registered under its real entity id, and every later lookup (skin, cape,
+     * display name, game mode) re-queries the map and picks the real entry up
+     * as soon as it exists.
+     */
+    public static Object spawnPlayerInfo(Object handlerObj, java.util.UUID id) {
+        if (handlerObj instanceof NetHandlerPlayClient) {
+            try {
+                NetworkPlayerInfo real = ((NetHandlerPlayClient) handlerObj).getPlayerInfo(id);
+                if (real != null) return real;
+            } catch (Throwable ignored) {}
+        }
+        String name = id == null ? "unknown" : id.toString();
+        return new NetworkPlayerInfo(new com.mojang.authlib.GameProfile(id, name));
     }
 
     /** Called at head of NetworkManager.channelRead0. Returns true = packet consumed. */
@@ -310,82 +351,198 @@ public final class NexusHooks {
     }
 
     /**
-     * RenderManager.renderEntity 头部守卫：保证 renderViewEntity 非 null。
-     * 为 null 时用 mc.getRenderViewEntity() 填回，填不上就跳过本次实体渲染。
+     * RenderManager.renderEntity 头部守卫：把 cacheActiveRenderInfo 会写的
+     * 状态字段（renderViewEntity / options / textRenderer / world）补齐。
+     * 断线、重连、loadWorld(null) 之后到下一次世界渲染之前，这些字段可能是
+     * null；HUD 类 mod 在 RenderGameOverlayEvent 里直接调 renderEntity（画
+     * 名字牌要读 options、textRenderer），就会 NPE 崩溃。
+     * 只补 null 字段，补的值与原版下一帧写入的相同，正常状态下不改任何东西。
+     * 补完后必需字段仍为 null（标题界面无视角实体）才跳过本次实体渲染。
      *
      * @return true 表示调用方应直接 return
      */
     public static boolean renderViewEntityGuard(Object renderManager) {
         if (renderManager == null) return false;
-        java.lang.reflect.Field f = renderViewField(renderManager.getClass());
-        if (f == null) return false;
         try {
-            if (f.get(renderManager) != null) return false;
             net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getMinecraft();
-            net.minecraft.entity.Entity fix = mc == null ? null : mc.getRenderViewEntity();
-            if (fix == null) {
+            if (mc != null && !com.mythos.nexus.session.NexusCtx.onBotThread()) {
+                fillRenderManagerState(renderManager, mc, "renderEntity");
+            }
+            Class<?> k = renderManager.getClass();
+            if (isNull(renderManager, typedField(k, net.minecraft.entity.Entity.class))) {
                 logViewFill("renderEntity 阶段 renderViewEntity 为空且无可补，跳过该实体");
                 return true;
             }
-            f.set(renderManager, fix);
-            logViewFill("renderEntity 阶段 renderViewEntity 为空，已补齐");
+            if (isNull(renderManager, typedField(k, net.minecraft.client.settings.GameSettings.class))
+                    || isNull(renderManager, typedField(k, net.minecraft.client.gui.FontRenderer.class))) {
+                logViewFill("renderEntity 阶段 options/textRenderer 为空且无可补，跳过该实体");
+                return true;
+            }
             return false;
         } catch (Throwable t) {
             return true;
         }
     }
 
-    private static volatile boolean viewFillLogged;
-
-    private static void logViewFill(String what) {
-        if (viewFillLogged) return;
-        viewFillLogged = true;
-        NexusPlugin.LOGGER.info("[guard] {}", what);
+    /**
+     * TileEntityRendererDispatcher.render 头部守卫：补齐 prepare() 会写的
+     * world / entity / fontRenderer / renderEngine。TESR 画名字牌读 entity，
+     * 告示牌读 fontRenderer，带光照的 render(TileEntity,F,I) 读 world。
+     * 只补 null 字段，值与原版 prepare() 写入的相同；从不跳过 —— 物品栏里
+     * 画箱子等 TEISR 在 world 为 null 时原版本来就能正常渲染。
+     */
+    public static void fillTileEntityRenderState(Object terd) {
+        if (terd == null) return;
+        try {
+            net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getMinecraft();
+            if (mc == null || com.mythos.nexus.session.NexusCtx.onBotThread()) return;
+            Class<?> k = terd.getClass();
+            if (fillIfNull(terd, typedField(k, net.minecraft.world.World.class), mc.world))
+                logViewFill("TileEntity 渲染阶段 world 为空，已补齐");
+            if (fillIfNull(terd, typedField(k, net.minecraft.entity.Entity.class), mc.getRenderViewEntity()))
+                logViewFill("TileEntity 渲染阶段 entity 为空，已补齐");
+            if (fillIfNull(terd, typedField(k, net.minecraft.client.gui.FontRenderer.class), mc.fontRenderer))
+                logViewFill("TileEntity 渲染阶段 fontRenderer 为空，已补齐");
+            if (fillIfNull(terd, typedField(k, net.minecraft.client.renderer.texture.TextureManager.class),
+                    mc.getTextureManager()))
+                logViewFill("TileEntity 渲染阶段 renderEngine 为空，已补齐");
+        } catch (Throwable ignored) {
+        }
     }
-
-    private static volatile java.lang.reflect.Field RM_VIEW_FIELD;
 
     /**
-     * RenderManager.renderViewEntity 在 obf / srg / mcp 三种状态下名字都不同，
-     * 先按已知名字找，再按「这个类里唯一的 Entity 类型字段」兜底 —— 不能靠名字
-     * 硬编码，否则换映射就静默失效。
+     * 带光照的 TileEntityRendererDispatcher.render(TileEntity,F,I) 无条件读
+     * this.world；补不上 world 时原版必然 NPE，此时跳过这一个方块实体。
+     *
+     * @return true 表示调用方应直接 return
      */
-    private static java.lang.reflect.Field renderViewField(Class<?> rmClass) {
-        java.lang.reflect.Field cached = RM_VIEW_FIELD;
-        if (cached != null && cached.getDeclaringClass() == rmClass) return cached;
-        for (String n : new String[]{"field_78734_h", "renderViewEntity"}) {
-            try {
-                java.lang.reflect.Field c = rmClass.getDeclaredField(n);
-                c.setAccessible(true);
-                RM_VIEW_FIELD = c;
-                return c;
-            } catch (Throwable ignored) {
+    public static boolean tileEntityWorldGuard(Object terd) {
+        if (terd == null) return false;
+        fillTileEntityRenderState(terd);
+        try {
+            if (isNull(terd, typedField(terd.getClass(), net.minecraft.world.World.class))) {
+                logViewFill("TileEntity 渲染阶段 world 为空且无可补，跳过该方块实体");
+                return true;
             }
+            return false;
+        } catch (Throwable t) {
+            return true;
         }
-        for (java.lang.reflect.Field c : rmClass.getDeclaredFields()) {
-            if (c.getType() == net.minecraft.entity.Entity.class) {
-                try { c.setAccessible(true); } catch (Throwable ignored) { }
-                RM_VIEW_FIELD = c;
-                return c;
-            }
-        }
-        return null;
     }
 
-    /** 每帧把 RenderManager.renderViewEntity 补上；已非 null 或无可补时不动。 */
+    /** 补 RenderManager 中 cacheActiveRenderInfo 会写的字段；pointedEntity 可合法为 null，不补。 */
+    private static void fillRenderManagerState(Object rm, net.minecraft.client.Minecraft mc, String phase)
+            throws IllegalAccessException {
+        Class<?> k = rm.getClass();
+        if (fillIfNull(rm, typedField(k, net.minecraft.entity.Entity.class), mc.getRenderViewEntity()))
+            logViewFill(phase + " 阶段 renderViewEntity 为空，已补齐");
+        if (fillIfNull(rm, typedField(k, net.minecraft.client.settings.GameSettings.class), mc.gameSettings))
+            logViewFill(phase + " 阶段 options 为空，已补齐");
+        if (fillIfNull(rm, typedField(k, net.minecraft.client.gui.FontRenderer.class), mc.fontRenderer))
+            logViewFill(phase + " 阶段 textRenderer 为空，已补齐");
+        if (fillIfNull(rm, typedField(k, net.minecraft.world.World.class), mc.world))
+            logViewFill(phase + " 阶段 world 为空，已补齐");
+        if (fillIfNull(rm, typedField(k, net.minecraft.client.renderer.texture.TextureManager.class),
+                mc.getTextureManager()))
+            logViewFill(phase + " 阶段 renderEngine 为空，已补齐");
+    }
+
+    /** @return true 表示确实写入了 */
+    private static boolean fillIfNull(Object owner, java.lang.reflect.Field f, Object value)
+            throws IllegalAccessException {
+        if (f == null || value == null || f.get(owner) != null) return false;
+        f.set(owner, value);
+        return true;
+    }
+
+    private static boolean isNull(Object owner, java.lang.reflect.Field f) throws IllegalAccessException {
+        return f != null && f.get(owner) == null;
+    }
+
+    private static final java.util.Set<String> VIEW_FILL_LOGGED =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** 每种情况只记一次，避免每帧刷屏，同时不让第一条把其它情况的日志吞掉。 */
+    private static void logViewFill(String what) {
+        if (VIEW_FILL_LOGGED.add(what)) NexusPlugin.LOGGER.info("[guard] {}", what);
+    }
+
+    /** 每个 owner 类一张「字段类型 → 字段」缓存；renderEntity 每个实体都会查，不能每次拼字符串。 */
+    private static final ClassValue<java.util.Map<Class<?>, java.util.Optional<java.lang.reflect.Field>>> TYPED_FIELDS =
+            new ClassValue<java.util.Map<Class<?>, java.util.Optional<java.lang.reflect.Field>>>() {
+                @Override
+                protected java.util.Map<Class<?>, java.util.Optional<java.lang.reflect.Field>> computeValue(Class<?> c) {
+                    return new java.util.concurrent.ConcurrentHashMap<>();
+                }
+            };
+
+    /**
+     * 字段类型 → 已知名字：RenderManager 的 srg、TileEntityRendererDispatcher 的 srg、mcp。
+     * 放在内部类里懒加载：NexusHooks 在 coremod 阶段就可能被初始化，此时引用
+     * Minecraft 类会让它们绕过转换器提前加载。
+     */
+    private static final class KnownFieldNames {
+        static final java.util.Map<Class<?>, String[]> MAP = new java.util.HashMap<>();
+        static {
+            MAP.put(net.minecraft.entity.Entity.class,
+                    new String[]{"field_78734_h", "field_147551_g", "renderViewEntity", "entity"});
+            MAP.put(net.minecraft.client.settings.GameSettings.class,
+                    new String[]{"field_78733_k", "options"});
+            MAP.put(net.minecraft.client.gui.FontRenderer.class,
+                    new String[]{"field_78736_p", "field_147557_n", "textRenderer", "fontRenderer"});
+            MAP.put(net.minecraft.world.World.class,
+                    new String[]{"field_78722_g", "field_147550_f", "world"});
+            MAP.put(net.minecraft.client.renderer.texture.TextureManager.class,
+                    new String[]{"field_78724_e", "field_147553_e", "renderEngine"});
+        }
+    }
+
+    /**
+     * 找 RenderManager / TileEntityRendererDispatcher 里声明类型精确等于 type
+     * 的实例字段。先按已知 srg / mcp 名字找（并校验类型），这样 OptiFine 等往
+     * 类里加同类型字段也不会认错；都不在（obf 运行环境）再按类型取第一个。
+     * RenderManager 的 pointedEntity 也是 Entity，按声明顺序排在
+     * renderViewEntity 之后，类型兜底同样取到 renderViewEntity。
+     */
+    private static java.lang.reflect.Field typedField(Class<?> owner, Class<?> type) {
+        java.util.Map<Class<?>, java.util.Optional<java.lang.reflect.Field>> cache = TYPED_FIELDS.get(owner);
+        java.util.Optional<java.lang.reflect.Field> cached = cache.get(type);
+        if (cached != null) return cached.orElse(null);
+        java.lang.reflect.Field found = null;
+        String[] names = KnownFieldNames.MAP.get(type);
+        if (names != null) {
+            for (String n : names) {
+                try {
+                    java.lang.reflect.Field c = owner.getDeclaredField(n);
+                    if (c.getType() == type) { found = c; break; }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        if (found == null) {
+            for (java.lang.reflect.Field c : owner.getDeclaredFields()) {
+                if (c.getType() == type && !java.lang.reflect.Modifier.isStatic(c.getModifiers())) {
+                    found = c;
+                    break;
+                }
+            }
+        }
+        if (found != null) {
+            try { found.setAccessible(true); } catch (Throwable ignored) { }
+        }
+        cache.put(type, java.util.Optional.ofNullable(found));
+        return found;
+    }
+
+    /** 每帧开头补齐 RenderManager 与 TileEntityRendererDispatcher 的渲染状态；已非 null 时只做反射读。 */
     public static void fillRenderViewEntity() {
         try {
             net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getMinecraft();
-            if (mc == null) return;
-            net.minecraft.entity.Entity view = mc.getRenderViewEntity();
-            if (view == null) return;
+            if (mc == null || com.mythos.nexus.session.NexusCtx.onBotThread()) return;
             Object rm = mc.getRenderManager();
-            if (rm == null) return;
-            java.lang.reflect.Field f = renderViewField(rm.getClass());
-            if (f != null && f.get(rm) == null) {
-                f.set(rm, view);
-                logViewFill("每帧补帧阶段 renderViewEntity 为空，已补齐");
-            }
+            if (rm != null) fillRenderManagerState(rm, mc, "每帧补帧");
+            fillTileEntityRenderState(
+                    net.minecraft.client.renderer.tileentity.TileEntityRendererDispatcher.instance);
         } catch (Throwable ignored) {
         }
     }
@@ -515,6 +672,262 @@ public final class NexusHooks {
     // screen goes black the last snapshot before the stall is the smoking gun.
 
     private static final AtomicLong tickCounter = new AtomicLong();
+
+    // Bot-thread marshalling for LWJGL window mutations. Harness-measured
+    // off-thread behaviour: setTitle / setLocation / setDisplayMode HANG —
+    // each takes GlobalLock and then blocks in a synchronous Win32 call that
+    // returns only once the owning thread pumps its message, while that thread
+    // is blocked on the same lock, so nothing ever pumps. setVSyncEnabled /
+    // setSwapInterval / update and GL11.* THROW "No OpenGL context found in the
+    // current thread" (the mutation is silently lost). Everything else is safe.
+    // Fix: keep the call, move the thread — inline on the client thread, queued
+    // for replay by heartbeat() everywhere else. FIFO order keeps multi-step
+    // sequences (DragonCore ol.m(int,int)) intact, and no MC / DragonCore /
+    // DragonArmourers code reads Display.getTitle(), so the <=1 tick delay is
+    // unobservable.
+
+    private static final java.util.concurrent.ConcurrentLinkedQueue<Runnable>
+            DISPLAY_OPS = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private static final AtomicLong deferredDisplayOps = new AtomicLong();
+    private static final AtomicLong droppedDisplayOps = new AtomicLong();
+    /** Cap: a mod spamming a window op every tick must not grow this without bound. */
+    private static final int MAX_DEFERRED_DISPLAY_OPS = 64;
+
+    /**
+     * Thread that owns the LWJGL window / Win32 message pump. Captured on the
+     * first heartbeat (i.e. the real client thread). Null until then, which is
+     * the pre-game-loop startup window where everything is single-threaded.
+     */
+    private static volatile Thread clientThreadRef;
+
+    /** True when the caller is NOT the window-owning thread (bot, netty, pool). */
+    private static boolean offClientThread() {
+        Thread ct = clientThreadRef;
+        // Before the first heartbeat we are still in startup: single-threaded,
+        // and the only window mutation in that window is MC's own window init.
+        if (ct == null) return false;
+        return Thread.currentThread() != ct;
+    }
+
+    /**
+     * Queue one window mutation for the client thread. FIFO and bounded: every
+     * operation here is last-write-wins on a single window attribute, so
+     * dropping the OLDEST entry is strictly better than unbounded growth.
+     */
+    private static void deferDisplayOp(String tag, Runnable op) {
+        if (DISPLAY_OPS.size() >= MAX_DEFERRED_DISPLAY_OPS) {
+            DISPLAY_OPS.poll();
+            if (droppedDisplayOps.incrementAndGet() % 100 == 1) {
+                NexusRefs.warnOnce("hooks:deferDrop:" + tag,
+                        new IllegalStateException("queue full"),
+                        "deferred Display." + tag + " queue full; dropping oldest");
+            }
+        }
+        DISPLAY_OPS.add(op);
+        deferredDisplayOps.incrementAndGet();
+    }
+
+    public static void safeSetTitle(final String title) {
+        if (!offClientThread()) {
+            org.lwjgl.opengl.Display.setTitle(title);
+            return;
+        }
+        deferDisplayOp("setTitle", new Runnable() {
+            @Override public void run() { org.lwjgl.opengl.Display.setTitle(title); }
+        });
+    }
+
+    public static void safeSetLocation(final int x, final int y) {
+        if (!offClientThread()) {
+            org.lwjgl.opengl.Display.setLocation(x, y);
+            return;
+        }
+        deferDisplayOp("setLocation", new Runnable() {
+            @Override public void run() { org.lwjgl.opengl.Display.setLocation(x, y); }
+        });
+    }
+
+    /** HANG member #3: ChangeDisplaySettings blocks on the owner's message loop. */
+    public static void safeSetDisplayMode(final Object modeObj)
+            throws org.lwjgl.LWJGLException {
+        // Object param (not DisplayMode) on purpose: this class is loaded by the
+        // coremod classloader and its declared signatures are resolved at class
+        // load, before the game has touched LWJGL. Call sites are rewritten to
+        // this descriptor; a DisplayMode argument is assignable to Object, so
+        // the verifier is happy and nothing extra is loaded early.
+        //
+        // throws LWJGLException for signature fidelity only — the verifier does
+        // not check checked exceptions, and every original caller already had to
+        // catch/declare it, so client-thread behaviour is bit-for-bit the same.
+        final org.lwjgl.opengl.DisplayMode mode = (org.lwjgl.opengl.DisplayMode) modeObj;
+        if (!offClientThread()) {
+            org.lwjgl.opengl.Display.setDisplayMode(mode);
+            return;
+        }
+        deferDisplayOp("setDisplayMode", new Runnable() {
+            @Override public void run() {
+                try {
+                    org.lwjgl.opengl.Display.setDisplayMode(mode);
+                } catch (Throwable t) {
+                    NexusRefs.warnOnce("hooks:deferSetDisplayMode", t,
+                            "deferred Display.setDisplayMode failed");
+                }
+            }
+        });
+    }
+
+    /**
+     * Safe off-thread, but DragonCore's ol.m(int,int) issues fullscreen →
+     * resizable → displayMode → vsync as one logical change; deferring only the
+     * blocking members would reorder it into a state the mod never asked for.
+     */
+    public static void safeSetFullscreen(final boolean fullscreen)
+            throws org.lwjgl.LWJGLException {
+        if (!offClientThread()) {
+            org.lwjgl.opengl.Display.setFullscreen(fullscreen);
+            return;
+        }
+        deferDisplayOp("setFullscreen", new Runnable() {
+            @Override public void run() {
+                try {
+                    org.lwjgl.opengl.Display.setFullscreen(fullscreen);
+                } catch (Throwable t) {
+                    NexusRefs.warnOnce("hooks:deferSetFullscreen", t,
+                            "deferred Display.setFullscreen failed");
+                }
+            }
+        });
+    }
+
+    public static void safeSetResizable(final boolean resizable) {
+        if (!offClientThread()) {
+            org.lwjgl.opengl.Display.setResizable(resizable);
+            return;
+        }
+        deferDisplayOp("setResizable", new Runnable() {
+            @Override public void run() {
+                try {
+                    org.lwjgl.opengl.Display.setResizable(resizable);
+                } catch (Throwable t) {
+                    NexusRefs.warnOnce("hooks:deferSetResizable", t,
+                            "deferred Display.setResizable failed");
+                }
+            }
+        });
+    }
+
+    /**
+     * Called from rewritten bytecode in place of
+     * Display.setDisplayModeAndFullscreen(DisplayMode) — same synchronous
+     * ChangeDisplaySettings path as setDisplayMode, so it hangs identically.
+     */
+    public static void safeSetDisplayModeAndFullscreen(final Object modeObj)
+            throws org.lwjgl.LWJGLException {
+        final org.lwjgl.opengl.DisplayMode mode = (org.lwjgl.opengl.DisplayMode) modeObj;
+        if (!offClientThread()) {
+            org.lwjgl.opengl.Display.setDisplayModeAndFullscreen(mode);
+            return;
+        }
+        deferDisplayOp("setDisplayModeAndFullscreen", new Runnable() {
+            @Override public void run() {
+                try {
+                    org.lwjgl.opengl.Display.setDisplayModeAndFullscreen(mode);
+                } catch (Throwable t) {
+                    NexusRefs.warnOnce("hooks:deferSetDisplayModeAndFullscreen", t,
+                            "deferred Display.setDisplayModeAndFullscreen failed");
+                }
+            }
+        });
+    }
+
+    public static void safeSetVSyncEnabled(final boolean enabled) {
+        if (!offClientThread()) {
+            org.lwjgl.opengl.Display.setVSyncEnabled(enabled);
+            return;
+        }
+        deferDisplayOp("setVSyncEnabled", new Runnable() {
+            @Override public void run() { org.lwjgl.opengl.Display.setVSyncEnabled(enabled); }
+        });
+    }
+
+    public static void safeSetSwapInterval(final int interval) {
+        if (!offClientThread()) {
+            org.lwjgl.opengl.Display.setSwapInterval(interval);
+            return;
+        }
+        deferDisplayOp("setSwapInterval", new Runnable() {
+            @Override public void run() { org.lwjgl.opengl.Display.setSwapInterval(interval); }
+        });
+    }
+
+    /** Head guard on Minecraft.resize(int,int) — @return true = skip the body.
+     *  Off-thread it does not crash, it silently desynchronises: measured
+     *  display=1024x640 while the framebuffer stayed 854x480, after which every
+     *  updateDisplay threw "No context is current". Deferred through the same
+     *  FIFO as the Display.setXxx hooks so the whole window-change chain replays
+     *  in request order. */
+    public static boolean resizeGuard(Object mcObj, final int width, final int height) {
+        if (!offClientThread()) return false;
+        final Minecraft mc = (mcObj instanceof Minecraft) ? (Minecraft) mcObj : null;
+        deferDisplayOp("resize", new Runnable() {
+            @Override public void run() {
+                Minecraft m = mc != null ? mc : resolveMinecraft();
+                if (m == null) return;
+                try {
+                    m.resize(width, height);
+                } catch (Throwable t) {
+                    NexusRefs.warnOnce("hooks:deferResize", t, "deferred Minecraft.resize failed");
+                }
+            }
+        });
+        return true;
+    }
+
+    /** Head guard on Minecraft.updateDisplay() — pumps window messages and
+     *  swaps buffers, which throws "No context is current" off-thread. */
+    public static boolean updateDisplayGuard(Object mcObj) {
+        if (!offClientThread()) return false;
+        final Minecraft mc = (mcObj instanceof Minecraft) ? (Minecraft) mcObj : null;
+        deferDisplayOp("updateDisplay", new Runnable() {
+            @Override public void run() {
+                Minecraft m = mc != null ? mc : resolveMinecraft();
+                if (m == null) return;
+                try {
+                    m.updateDisplay();
+                } catch (Throwable t) {
+                    NexusRefs.warnOnce("hooks:deferUpdateDisplay", t,
+                            "deferred Minecraft.updateDisplay failed");
+                }
+            }
+        });
+        return true;
+    }
+
+    /** Drain queued window mutations — runs on the client thread from heartbeat(). */
+    private static void drainDisplayOps() {
+        if (DISPLAY_OPS.isEmpty()) return;
+        Runnable r;
+        int guard = 0;
+        while ((r = DISPLAY_OPS.poll()) != null && guard++ < MAX_DEFERRED_DISPLAY_OPS) {
+            try { r.run(); } catch (Throwable t) {
+                NexusRefs.warnOnce("hooks:deferOpRun", t, "deferred Display op failed");
+            }
+        }
+    }
+
+    /** Client-thread tick counter (also the watchdog's liveness signal). */
+    public static long heartbeatCount() { return tickCounter.get(); }
+
+    /** Deferred-op counters, for the watchdog line. */
+    public static long deferredDisplayOpCount() { return deferredDisplayOps.get(); }
+    public static long droppedDisplayOpCount() { return droppedDisplayOps.get(); }
+
+    // Client-thread liveness: written by heartbeat() every tick, read by the
+    // watchdog so it can report "the client thread is stuck" WITHOUT taking
+    // LWJGL's GlobalLock (which is exactly what the old Display.isCloseRequested
+    // probe did — that made the watchdog a victim of the very deadlock it was
+    // supposed to detect).
+    private static volatile long lastHeartbeatMs;
     private static final AtomicLong glErrSticky = new AtomicLong(-1);
     private static Thread watchdogThread;
     private static net.minecraft.client.entity.EntityPlayerSP lastHumanPlayer;
@@ -526,6 +939,14 @@ public final class NexusHooks {
 
     private static void heartbeat() {
         tickCounter.incrementAndGet();
+        lastHeartbeatMs = System.currentTimeMillis();
+        // Remember which thread actually owns the GL context / window so the
+        // Display guards can tell "real client thread" from "anyone else".
+        if (clientThreadRef != Thread.currentThread()) {
+            clientThreadRef = Thread.currentThread();
+        }
+        // Replay window mutations a bot thread deferred (see safeSetTitle).
+        drainDisplayOps();
         // Sample GL error cheaply once per second (every 20 ticks) — calling
         // glGetError every tick would hide real errors behind our own probe.
         if (tickCounter.get() % 20 == 0) {
@@ -615,11 +1036,18 @@ public final class NexusHooks {
                     long ticks = t - lastTick;
                     lastTick = t;
                     long gle = glErrSticky.getAndSet(-1);
+                    // Client-thread liveness: the age of the last heartbeat tick.
+                    // Computed BEFORE anomaly so a frozen client thread (which by
+                    // definition cannot tick) escalates to the main log even when
+                    // nexus.debugLog is off — otherwise the one diagnostic that
+                    // matters most would only be written to the disabled log.
+                    long age = System.currentTimeMillis() - lastHeartbeatMs;
+                    boolean stalled = lastHeartbeatMs != 0 && age > 3000L;
                     // A snapshot every 2 s belongs in watchdog.log (enable with
                     // -Dnexus.debugLog=true), not in the console. Only a stalled
                     // tick or a GL error is worth the main log, because those are
                     // the two states that actually freeze the screen.
-                    boolean anomaly = ticks == 0 || gle >= 0;
+                    boolean anomaly = ticks == 0 || gle >= 0 || stalled;
                     if (!NexusLog.ENABLED && !anomaly) {
                         continue;
                     }
@@ -643,19 +1071,19 @@ public final class NexusHooks {
                         } catch (Throwable t2) { try { java.lang.reflect.Field wf = rg.getClass().getDeclaredField("world"); wf.setAccessible(true); Object rgw = wf.get(rg); rgwS = rgw == null ? "null" : Integer.toHexString(System.identityHashCode(rgw)); } catch (Throwable t3) { rgwS = "?"; } }
                     }
                     String rgS = (rg == null ? "null" : Integer.toHexString(System.identityHashCode(rg))) + "/" + rgwS;
-                    // Display state via reflection (coremod can reference it but
-                    // avoid hard dependency — some test contexts have no Display)
-                    String disp;
-                    try {
-                        Class<?> d = Class.forName("org.lwjgl.opengl.Display");
-                        boolean close = (Boolean) d.getMethod("isCloseRequested").invoke(null);
-                        boolean active = (Boolean) d.getMethod("isActive").invoke(null);
-                        boolean visible = (Boolean) d.getMethod("isVisible").invoke(null);
-                        disp = "close=" + close + " active=" + active + " vis=" + visible;
-                    } catch (Throwable t2) { disp = "err"; }
+                    // Client-thread liveness by heartbeat age, NOT a Display probe: the old
+                    // Display.isCloseRequested/isActive reflection took LWJGL GlobalLock — the
+                    // very lock a stuck setTitle holds — so the watchdog blocked on the same
+                    // monitor it was watching (remote dump: nexus-watchdog BLOCKED at
+                    // NexusHooks.java:651). heartbeat() runs every tick anyway, so its age is an
+                    // equivalent and strictly stronger signal.
+                    String disp = (lastHeartbeatMs == 0 ? "n/a" : age + "ms")
+                            + " deferred=" + deferredDisplayOps.get()
+                            + " dropped=" + droppedDisplayOps.get();
                     String line = "[wd] tick+" + ticks + "/2s mounted=" + mname
                             + " w=" + w + " p=" + p + " ve=" + veS + " rg=" + rgS
-                            + " screen=" + s + " gl=" + gle + " disp[" + disp + "]";
+                            + " screen=" + s + " gl=" + gle + " beat=" + disp
+                            + (stalled ? " STALLED" : "");
                     if (NexusLog.ENABLED) {
                         NexusLog.log("watchdog", line);
                     }
@@ -670,19 +1098,10 @@ public final class NexusHooks {
     }
 
     /**
-     * displayGuiScreen writes mc.currentScreen AND re-inits GuiGameOver /
-     * other screens against the *mounted* session's world — if a bot's
-     * packet opens a death/gameover screen while it's mounted, or the
-     * human's screen flickers into a bot's world, that NPEs.
-     *
-     * The lazy fix: wrap displayGuiScreen itself. When a bot's packet is
-     * dispatching inside withContext the session fields ARE live, so the
-     * screen init is safe; the crash only happens when something calls
-     * displayGuiScreen on the client thread while an OFFLINE session is
-     * mounted (world==null → GuiGameOver.initGui does
-     * mc.world.getWorldInfo() → NPE). Gate that case: if the incoming
-     * screen is a GuiGameOver and there's no live world, swallow the call —
-     * a dead player on a session with no world is a no-op anyway.
+     * displayGuiScreen writes mc.currentScreen AND re-inits the incoming screen
+     * against the *mounted* session's world. With an OFFLINE session mounted
+     * (world==null) GuiGameOver.initGui does mc.world.getWorldInfo() -> NPE; a
+     * bot's packet opening any screen would also init it against the wrong world.
      *
      * @return true to skip vanilla displayGuiScreen
      */
@@ -762,32 +1181,18 @@ public final class NexusHooks {
     }
 
     /**
-     * Session-scoped replacement for Minecraft.loadWorld/func_71353_a when it
-     * runs on a background session's context (bot tick thread). Vanilla
-     * loadWorld does ~225 bytecode ops that write the SHARED mc singleton
-     * (world/player/playerController/renderViewEntity/myNetworkManager) and
-     * call SHARED render+sound objects (entityRenderer.updateRenderer → GL,
-     * ParticleManager.clearEffects, TileEntityRendererDispatcher.setWorld,
-     * clearRenderCache, mcSoundHandler, LoadingScreenRenderer, System.gc,
-     * WorldEvent Unload posts). On a bot thread that both (a) never lands the
-     * bot's world in BotSession.world — so markOnlineIfReady never fires and
-     * the bot is stuck CONNECTING — and (b) races/stomps the mounted
-     * session's render state on the client thread.
+     * Session-scoped replacement for Minecraft.loadWorld when a background
+     * session (bot tick thread) is the caller. Vanilla loadWorld writes the
+     * shared mc singleton (world/player/playerController/renderViewEntity/
+     * myNetworkManager) and touches shared render+sound objects (updateRenderer,
+     * clearEffects, TileEntityRendererDispatcher, SoundHandler, System.gc) — on a
+     * bot thread it both fails to land the world in BotSession.world (so
+     * markOnlineIfReady never fires and the bot stays CONNECTING) and stomps the
+     * mounted session's render state. Here only the parts a background session
+     * needs run, on its own fields.
      *
-     * Here we perform only the parts a background session actually needs, on
-     * the SESSION's own fields, never touching shared objects:
-     *   s.world = wc
-     *   s.playerController = the controller handleJoinGame already routed in
-     *     (NetHandlerPlayClient is field-ctx → its putfield wrote s.playerController)
-     *   s.player = playerController.createPlayer(wc, ...)   [if null]
-     *   player.movementInput = MovementInputFromOptions(gameSettings)
-     *   playerController.flipPlayer(player) + .setController(player)
-     * renderViewEntity resolves to s.player through NexusCtx, so nothing else
-     * needs wiring.
-     *
-     * Returns true when it handled the call (background session) — the
-     * caller's real loadWorld body is skipped. Returns false on the client
-     * thread / mounted session so vanilla still runs for the human.
+     * @return true when handled (background session) — skip the vanilla body;
+     *         false on the client thread / foreground so the human still runs it.
      */
     public static boolean loadWorldForBot(Object mcObj, Object wcObj) {
         BotSession s = CTX.get();
@@ -859,19 +1264,13 @@ public final class NexusHooks {
     }
 
     /**
-     * Bot-side setDimensionAndSpawnPlayer (SPacketRespawn). The vanilla method
-     * (Minecraft.java:2054-2087) rebuilds the player entity and re-adds it to
-     * the world — but it does so on the shared mc.world/player/renderViewEntity
-     * singletons, so on a bot tick thread it would corrupt the mounted session
-     * and never respawn the bot's own entity. Reproduce the essential parts on
-     * the bound session's fields: swap the stale player for a fresh
-     * EntityPlayerSP, carry over stats/recipes/data, then prepare+spawn so the
-     * new player is a live world entity (addedToChunk=true, in loadedEntityList)
-     * — the same two calls loadWorldForBot needs.
+     * Bot-side setDimensionAndSpawnPlayer (SPacketRespawn). Vanilla rebuilds the
+     * player on the shared mc singletons, which on a bot tick thread would corrupt
+     * the mounted session and never respawn the bot's own entity; this swaps the
+     * stale player for a fresh EntityPlayerSP on the bound session's fields and
+     * prepares+spawns it so it lands in loadedEntityList.
      *
-     * Returns true when it handled the call (background session) — the caller's
-     * vanilla body is skipped. False on client thread / foreground so the human
-     * still respawns normally.
+     * @return true when handled (background session) — skip the vanilla body.
      */
     public static boolean respawnForBot(Object mcObj, int dimension) {
         BotSession s = CTX.get();
@@ -889,13 +1288,10 @@ public final class NexusHooks {
         net.minecraft.client.entity.EntityPlayerSP old = s.player;
         int oldId = old != null ? old.getEntityId() : 0;
         String brand = old != null ? old.getServerBrand() : null;
-        // Remove EVERY EntityPlayerSP currently in loadedEntityList — not just
-        // `old`. A previous loadWorldForBot/respawn may have left a stale
-        // EntityPlayerSP ticking on this bot thread; it keeps calling
-        // onUpdateWalkingPlayer → sendPacket on this session's channel with its
-        // own (drifting) position while s.player sits frozen — that's the
-        // "teleport" the server sees. Purge all of them before spawning the
-        // fresh player.
+        // Purge EVERY EntityPlayerSP, not just `old`: a leftover from an earlier
+        // loadWorldForBot/respawn keeps calling onUpdateWalkingPlayer on this
+        // bot thread, sending its drifting position on this session's channel
+        // while s.player sits frozen — which the server reads as teleporting.
         for (int i = wc.loadedEntityList.size() - 1; i >= 0; i--) {
             net.minecraft.entity.Entity e = wc.loadedEntityList.get(i);
             if (e instanceof net.minecraft.client.entity.EntityPlayerSP) {
@@ -937,13 +1333,10 @@ public final class NexusHooks {
 
     /**
      * True while a non-mounted session is dispatching packets inside
-     * withContext.  MythosScript (and any other mod reading
-     * Minecraft.getMinecraft() from the packet thread) sees the *mounted*
-     * session's world/player during that window — which is exactly wrong.
-     * Callers that can ask this guard skip their work entirely; callers
-     * that can't (background world rendering for non-mounted bots is the
-     * whole point of this mod) must tolerate the singleton pointing at a
-     * different session for the duration of the dispatch.
+     * withContext — a mod reading Minecraft.getMinecraft() from that thread sees
+     * the *mounted* session's world/player, which is exactly wrong. Callers that
+     * can ask skip their work; callers that cannot (background world rendering is
+     * this mod's whole point) must tolerate it.
      */
     private static final ThreadLocal<BotSession> CTX = new ThreadLocal<>();
     public static void enterContext(BotSession s) { CTX.set(s); }
@@ -963,11 +1356,10 @@ public final class NexusHooks {
 
     //
     // NetHandlerPlayClient.onDisconnect runs mc.loadWorld(null) +
-    // displayGuiScreen(GuiDisconnected). For a bot handler that would nuke
-    // the MOUNTED session's world and hang the client. The transformer
-    // wraps the body: push the owning session's context (its fields get the
-    // loadWorld(null) clearing + the GuiDisconnected lands in its
-    // savedScreen), then pop and restore whatever screen was showing.
+    // displayGuiScreen(GuiDisconnected); for a bot handler that would nuke the
+    // MOUNTED session's world and hang the client. The transformer wraps the
+    // body with the owning session's context pushed, then pops and restores
+    // whatever screen was showing.
     private static final ThreadLocal<BotSession> DISC_CTX = new ThreadLocal<>();
     private static final ThreadLocal<Object> DISC_SCREEN = new ThreadLocal<>();
 
@@ -1089,15 +1481,11 @@ public final class NexusHooks {
     }
 
     //
-    // MythosScript's features are driven by Forge's ClientTickEvent on the
-    // *client* thread — which only ever sees the mounted session's world.
-    // To give every online bot its own MythosScript tick we re-fire the
-    // event inside each session's withContext, but ONLY for handlers we
-    // explicitly opt in (re-firing every mod would double-fire Forge's own
-    // listeners).
     //
-    // The actual pumping lives in SessionTicker — this class keeps the
-    // public ASM entry points.
+    // Forge's ClientTickEvent only ever fires on the client thread, so bots would
+    // never see it. We re-fire it inside each session's withContext, but only for
+    // handlers that opted in (re-firing every mod would double-fire Forge's own
+    // listeners). The pumping itself lives in SessionTicker.
 
     /** MythosScript registers its per-session tick hooks here via reflection
      *  (it's a different jar — no compile dep). Delegates to SessionTicker. */

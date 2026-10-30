@@ -26,13 +26,11 @@ import net.minecraft.network.play.server.SPacketTabComplete;
 import net.minecraft.network.play.server.SPacketTitle;
 import net.minecraft.network.play.server.SPacketUpdateBossInfo;
 
-import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * The packet dispatch queue: netty threads enqueue server packets here via
  * NexusHooks.onPacketRead, and the client thread drains the queue once per
  * tick inside each session's context (SessionTicker calls pump()).
- * Extracted from NexusHooks.
  */
 public final class PacketPump {
 
@@ -48,19 +46,23 @@ public final class PacketPump {
         }
     }
 
-    /** Legacy shared queue — kept for the human/mounted session which still
-     *  drains on the client thread. Each background bot instead owns its own
-     *  queue drained by its dedicated tick thread (see BotTicker) so a worker
-     *  can never steal another session's packets mid-dispatch. */
-    private static final ConcurrentLinkedQueue<QueuedPacket>
-            PENDING_PACKETS = new ConcurrentLinkedQueue<>();
+    static final int MAX_PENDING_PACKETS = 20000;
+
+    /** Shared queue for the human/mounted session, drained on the client thread. */
+    private static final java.util.concurrent.ArrayBlockingQueue<QueuedPacket>
+            PENDING_PACKETS = new java.util.concurrent.ArrayBlockingQueue<>(MAX_PENDING_PACKETS);
 
     /** Per-session queues for bot sessions dispatched on their own threads.
      *  Keyed by the session — ConcurrentHashMap so enqueue from netty and
      *  dequeue from the bot thread never contend on a lock. */
     private static final java.util.concurrent.ConcurrentHashMap<BotSession,
-            ConcurrentLinkedQueue<QueuedPacket>> PER_SESSION =
+            java.util.concurrent.ArrayBlockingQueue<QueuedPacket>> PER_SESSION =
             new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Packets dropped because a queue was full — surfaced in the watchdog
+     *  line so a stuck session is visible instead of silent. */
+    private static final java.util.concurrent.atomic.AtomicLong PACKET_OVERFLOW =
+            new java.util.concurrent.atomic.AtomicLong();
 
     /** Enqueue a packet for client-thread dispatch inside ctx's context.
      *  Called from NexusHooks.onPacketRead on the netty IO thread. Routes to
@@ -68,38 +70,52 @@ public final class PacketPump {
      *  shared queue (human/mounted + not-yet-online sessions). */
     public static void enqueue(BotSession ctx, Packet<INetHandler> packet,
                                INetHandler handler) {
-        // Route every packet for a NON-foreground session to that session's
-        // own queue, drained serially by its dedicated tick thread. Gating on
-        // hasTicker() — the old behaviour — split one session's packet stream
-        // across two threads the moment its ticker started mid-connect: the
-        // client-thread pump() then dispatched a background bot's spawn/move
-        // packets inside the bot's withContext (a real mc.* swap on the render
-        // thread) while its own thread dispatched the tail — out-of-order
-        // spawn→move meant getEntityByID returned null and every movement
-        // packet NPE'd until the circuit-breaker killed the bot.
-        // Queued-before-ticker packets simply wait: pumpFor drains them the
-        // first tick once the world is online, and drop() clears them on
-        // disconnect so nothing leaks for a session that never finishes
-        // connecting.
+        // Gating this on hasTicker() split one session's stream across two
+        // threads when its ticker started mid-connect; the resulting
+        // out-of-order spawn->move made getEntityByID return null and every
+        // movement packet NPE'd. Packets queued before the ticker exists just
+        // wait for pumpFor's first tick (drop() clears them on disconnect).
         if (ctx != null && !SessionManager.get().isForeground(ctx)) {
-            ConcurrentLinkedQueue<QueuedPacket> q = PER_SESSION.get(ctx);
+            java.util.concurrent.ArrayBlockingQueue<QueuedPacket> q = PER_SESSION.get(ctx);
             if (q == null) {
-                ConcurrentLinkedQueue<QueuedPacket> nq = new ConcurrentLinkedQueue<>();
-                ConcurrentLinkedQueue<QueuedPacket> prev =
+                java.util.concurrent.ArrayBlockingQueue<QueuedPacket> nq =
+                        new java.util.concurrent.ArrayBlockingQueue<>(MAX_PENDING_PACKETS);
+                java.util.concurrent.ArrayBlockingQueue<QueuedPacket> prev =
                         PER_SESSION.putIfAbsent(ctx, nq);
                 q = prev != null ? prev : nq;
             }
-            q.add(new QueuedPacket(ctx, packet, handler));
+            if (!q.offer(new QueuedPacket(ctx, packet, handler))) {
+                overflow(ctx, packet);
+                return;
+            }
             bumpEnq(ctx, packet.getClass().getSimpleName());
             return;
         }
-        PENDING_PACKETS.add(new QueuedPacket(ctx, packet, handler));
+        if (!PENDING_PACKETS.offer(new QueuedPacket(ctx, packet, handler))) {
+            overflow(ctx, packet);
+        }
     }
+
+    /** A full queue means this session stopped draining — its ticker died or
+     *  its world never came up. Drop the newest packet (the backlog is already
+     *  stale) and count it, so one broken session cannot OOM the process that
+     *  hosts every other session. */
+    private static void overflow(BotSession ctx, Packet<INetHandler> packet) {
+        long n = PACKET_OVERFLOW.incrementAndGet();
+        if (n % 500 == 1) {
+            NexusPlugin.LOGGER.warn("packet queue full ({} dropped) — newest {} for {} dropped",
+                    n, packet.getClass().getSimpleName(),
+                    ctx == null ? "human" : ctx.username);
+        }
+    }
+
+    /** Total packets dropped because a queue was full. */
+    public static long overflowCount() { return PACKET_OVERFLOW.get(); }
 
     /** Drain every queued packet for `ctx` — called ON the session's own
      *  tick thread by BotTicker. Returns the number drained. */
     public static int pumpFor(BotSession ctx) {
-        ConcurrentLinkedQueue<QueuedPacket> q = PER_SESSION.get(ctx);
+        java.util.concurrent.ArrayBlockingQueue<QueuedPacket> q = PER_SESSION.get(ctx);
         if (q == null) return 0;
         int n = 0;
         QueuedPacket qp;
@@ -138,9 +154,6 @@ public final class PacketPump {
                 final Packet<INetHandler> p = qp.packet;
                 final INetHandler h = qp.handler;
                 bumpDisp(ctx, p.getClass().getName());
-                // One-shot identity probe: is the world this handler writes to
-                // the same object as s.world? First entity-movement packet per
-                // session logs both identity hashes.
                 String pnn = p.getClass().getName();
                 if ((pnn.contains("SPacketEntity") || pnn.contains("SPacketDestroyEntities"))
                         && WORLD_MISMATCH_CHECKS.add(ctx.username)) {
@@ -157,12 +170,6 @@ public final class PacketPump {
                         NexusLog.session("[pkt-probe] sess=%s probe-fail %s", ctx.username, t);
                     }
                 }
-                // Probe 2: loadedEntityList vs entitiesById consistency — if
-                // spawns land in loadedEntityList but not the id map, every
-                // getEntityByID in handleEntity/Teleport/Destroy returns null
-                // and the world looks frozen while still showing entities.
-                // Periodic: every 30s per session, plus a per-entity mutation
-                // snapshot so we see whether handleEntity writes actually stick.
                 if (ctx.world != null && pnn.contains("SPacketEntity")) {
                     try {
                         long now2 = System.currentTimeMillis();
@@ -191,10 +198,6 @@ public final class PacketPump {
                         NexusLog.session("[pkt-probe2] sess=%s probe-fail %s", ctx.username, t);
                     }
                 }
-                // Probe 3: for move/teleport packets, snapshot the target's
-                // position BEFORE and AFTER processPacket to prove whether the
-                // handler writes. SPacketEntity* has getEntity(World) accessor
-                // but the entityId field is private — read via reflection.
                 final int[] p3ent = { -1 };
                 if (ctx.world != null && !SessionManager.get().isForeground(ctx)
                         && (pnn.contains("SPacketEntityTeleport")
@@ -223,43 +226,33 @@ public final class PacketPump {
                     private volatile boolean done;
                     @Override public void run() {
                         if (done) return; done = true;
-                        // Intercept chat packets before dispatch — feed the
-                        // session's chat ring buffer for aggregation.
                         if ((Packet<?>) p instanceof SPacketChat) {
                             try {
                                 SPacketChat cp2 = (SPacketChat) (Packet<?>) p;
                                 net.minecraft.util.text.ITextComponent tc = cp2.getChatComponent();
                                 if (tc != null) ctx.addChat(tc);
                             } catch (Throwable ignored) {}
-                            // GuiIngame and CustomGuiNewChat are client-wide. Keep
-                            // background chat in the per-session ring, but never
-                            // let vanilla mutate the shared chat list off-thread.
+                            // GuiIngame/CustomGuiNewChat are client-wide; a background
+                            // session must not mutate the shared chat list off-thread.
                             if (!foreground) return;
                         }
                         try {
                             p.processPacket(h);
                         } catch (Throwable t) {
-                            // Entity movement/block packets can legitimately
-                            // arrive for an entity that was not present in a
-                            // session's local WorldClient yet. Discard that
-                            // packet instead of transitioning the session to
-                            // ERROR and starving its later corrections.
-                            // Keep draining later packets, but never hide failures.
+                            // A not-yet-known entity is expected; swallow the packet
+                            // but count it, never hide it.
                             long failures = ++ctx.packetFailures;
                             if (failures == 1 || failures % 100 == 0) {
                                 NexusLog.error("packet failed sess=%s type=%s failures=%d",
                                         t, ctx.username, p.getClass().getSimpleName(), failures);
                             }
-                            // Circuit breaker: a session that can't process
-                            // any packet is a zombie — disconnect it so the
-                            // reconnect logic or the user can restart clean.
+                            // Zombie session: disconnect so reconnect can take over.
                             if (failures >= 500 && failures % 500 == 0) {
                                 ctx.logEvent("ERROR", "packet failure circuit breaker ("
                                         + failures + ") — disconnecting");
                                 ctx.disconnect("packet failure circuit breaker");
                             }
                         }
-                        // Probe 3 post-check: did the handler mutate pos?
                         if (p3ent[0] >= 0 && ctx.world != null) {
                             try {
                                 net.minecraft.entity.Entity t2 = ctx.world.getEntityByID(p3ent[0]);
@@ -280,9 +273,7 @@ public final class PacketPump {
             }
     }
 
-    // dispatch). Dumps once per 60s per session to session.log so we can see
-    // whether entity packets are being consumed before the queue, dropped at
-    // enqueue, or dying inside dispatch. ----
+    /** Enqueue/dispatch counters dumped every 60s per session (see maybeDump). */
     private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>
             ENQ = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>

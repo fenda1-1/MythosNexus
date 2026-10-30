@@ -40,6 +40,8 @@ public class MythosNexusMod {
         ClientRegistry.registerKeyBinding(KEY_MOUNT_HUMAN);
         MinecraftForge.EVENT_BUS.register(this);
         MinecraftForge.EVENT_BUS.register(com.mythos.nexus.session.BotStatusOverlay.get());
+        // 后台先把高清字体（CJK TTF，十几 MB）解析好，打开 Nexus 界面时就没有首帧等待
+        com.mythos.nexus.ui.text.NexusFont.warmUpAsync();
         // 人物同步：每个会话自己的 tick 钩子里跑一次，主控发布快照、跟随者镜像。
         com.mythos.nexus.session.SessionTicker.registerTickHook(() -> {
             com.mythos.nexus.session.BotSession me =

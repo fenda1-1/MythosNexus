@@ -9,7 +9,6 @@ import net.minecraft.network.Packet;
  * Per-session tick pumping: once per Minecraft.runTick, drain the packet
  * queue, flush deferred mounts, and drive every online background session's
  * world tick + registered per-session tick hooks inside its own context.
- * Extracted from NexusHooks.runSessionTicks.
  */
 public final class SessionTicker {
 

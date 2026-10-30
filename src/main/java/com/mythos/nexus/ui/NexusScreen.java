@@ -223,11 +223,13 @@ public class NexusScreen extends GuiScreen {
 
 
     void clipPush(int x, int y, int w, int h) {
-        int sf = Math.max(1, guiScaleFactor);
+        double sf = guiScaleFactor;
         int ph = mc.displayHeight;
         GL11.glEnable(GL11.GL_SCISSOR_TEST);
-        GL11.glScissor(x * sf, ph - (y + h) * sf,
-                Math.max(0, w) * sf, Math.max(0, h) * sf);
+        GL11.glScissor((int) Math.round(x * sf),
+                (int) Math.round(ph - (y + h) * sf),
+                Math.max(0, (int) Math.round(Math.max(0, w) * sf)),
+                Math.max(0, (int) Math.round(Math.max(0, h) * sf)));
     }
 
     void clipPop() {
@@ -258,6 +260,11 @@ public class NexusScreen extends GuiScreen {
 
     @Override
     public void initGui() {
+        // 高清字体：装上我们自己的 FontRenderer，面板里所有 font() 调用（252 处 drawString、
+        // 69 处 getStringWidth）自动走它；字体还在后台解析时它会逐帧回退原版。
+        // 必须在 super.setWorldAndResolution（先赋 fontRenderer = mc.fontRenderer）之后，
+        // 且在本函数后面那些 GuiTextField 构造之前。
+        fontRenderer = com.mythos.nexus.ui.text.NexusFont.install(mc);
         Keyboard.enableRepeatEvents(true);
         com.mythos.nexus.core.NexusConfig.applySavedTheme();
         fitColumns();
@@ -408,35 +415,146 @@ public class NexusScreen extends GuiScreen {
         liveWasActive = false;
     }
 
-    /** Nexus always lays out at GUI scale 2 ("中") regardless of the game's
-     *  own GUI-scale option — the layout is designed for that size. */
-    static final int FIXED_GUI_SCALE = 2;
-    /** Effective scale factor (may drop below FIXED_GUI_SCALE on tiny windows,
-     *  same rule as vanilla ScaledResolution). */
-    int guiScaleFactor = FIXED_GUI_SCALE;
+    /** 设计基准：100% 时一个虚拟像素 = 一个屏幕像素。 */
+    static final double UI_ZOOM_BASE = NexusConfig.UI_ZOOM_DEFAULT;
+    /** 每按一次 +/- 的步长（5%），Ctrl + 滚轮也是 5% —— 1% 太慢，用户要的是快。 */
+    static final double ZOOM_STEP = 0.05D;
+    /** 长按 Ctrl + +/- 时的连发：先等 300ms，再每 55ms 一档（约 18 档/秒）。 */
+    static final long ZOOM_HOLD_DELAY_MS = 300L;
+    static final long ZOOM_HOLD_REPEAT_MS = 55L;
+    /** Effective scale factor: the user zoom, capped by the window size (same
+     *  rule as vanilla ScaledResolution — one virtual pixel = guiScaleFactor px).
+     *  浮点数：1.0 = 100%，1.25 = 125%，不做整数档。 */
+    double guiScaleFactor = UI_ZOOM_BASE;
+    /** Requested zoom (0.50 .. 3.00). Persisted in NexusConfig as a percent. */
+    double uiZoom = NexusConfig.uiZoom();
 
-    private static int fixedScaleFor(net.minecraft.client.Minecraft m) {
-        int dw = m.displayWidth, dh = m.displayHeight;
-        int sf = 1;
-        while (sf < FIXED_GUI_SCALE && dw / (sf + 1) >= 320 && dh / (sf + 1) >= 240) sf++;
-        return sf;
+    /** Below this the three-column layout has no room left (rail + right + center). */
+    static final int MIN_VIRTUAL_W = 480;
+    static final int MIN_VIRTUAL_H = 260;
+
+    /** Clamp the requested zoom so the virtual window keeps enough room for the layout.
+     *  Returns the usable factor (whole percent so the label never says 117.4%). */
+    static double zoomFor(net.minecraft.client.Minecraft m, double wanted) {
+        double maxByWindow = Math.min(m.displayWidth / (double) MIN_VIRTUAL_W,
+                                      m.displayHeight / (double) MIN_VIRTUAL_H);
+        double z = Math.min(wanted, maxByWindow);
+        z = Math.min(NexusConfig.UI_ZOOM_MAX, Math.max(NexusConfig.UI_ZOOM_MIN, z));
+        z = Math.floor(z * 100.0D) / 100.0D;   // 向下取整到整百分比，避免算出来比窗口还大
+        return Math.max(NexusConfig.UI_ZOOM_MIN, z);
     }
 
     @Override
     public void setWorldAndResolution(net.minecraft.client.Minecraft m, int w, int h) {
         // vanilla passes width/height from the game's GUI scale; replace them
-        // with our fixed-scale size (also covers window resize via onResize)
-        guiScaleFactor = fixedScaleFor(m);
+        // with our zoom size (also covers window resize via onResize)
+        guiScaleFactor = zoomFor(m, uiZoom);
         super.setWorldAndResolution(m,
-                (int) Math.ceil(m.displayWidth / (double) guiScaleFactor),
-                (int) Math.ceil(m.displayHeight / (double) guiScaleFactor));
+                (int) Math.ceil(m.displayWidth / guiScaleFactor),
+                (int) Math.ceil(m.displayHeight / guiScaleFactor));
+    }
+
+    // ---- 界面缩放：Ctrl + + / Ctrl + - 让文字和全部布局尺寸一起变大 / 变小 ----
+
+    /** One zoom step (+1 = 放大, -1 = 缩小)：默认 5%，按住会连发；滚轮也走这里。 */
+    void zoomBy(int dir) { zoomBy(dir, ZOOM_STEP); }
+
+    void zoomBy(int dir, double step) {
+        double next = Math.round((uiZoom + dir * step) * 100.0D) / 100.0D;
+        next = Math.max(NexusConfig.UI_ZOOM_MIN, Math.min(NexusConfig.UI_ZOOM_MAX, next));
+        if (Math.abs(next - uiZoom) < 0.0001D) {
+            toast(dir > 0 ? "界面已是最大 " + pct(NexusConfig.UI_ZOOM_MAX)
+                          : "界面已是最小 " + pct(NexusConfig.UI_ZOOM_MIN), 1500);
+            return;
+        }
+        applyZoom(next);
+    }
+
+    /** Ctrl + 0 — 回到设计基准 100%。 */
+    void resetZoom() { applyZoom(UI_ZOOM_BASE); }
+
+    /**
+     * 高清字体开关。{@code GuiTextField} 的 fontRenderer 是 final 字段，没法热替换，
+     * 所以这里只写配置：下次 initGui（重新打开界面）时文本输入框会用新字体重建。
+     */
+    void toggleHdFont() {
+        boolean on = !com.mythos.nexus.core.NexusConfig.hdFont();
+        com.mythos.nexus.core.NexusConfig.setHdFont(on);
+        toast(on ? "高清字体已开启，重新打开界面生效" : "高清字体已关闭，重新打开界面生效", 2200L);
+    }
+
+    // ---- 长按连续缩放 -------------------------------------------------------
+    // 1.12 的屏幕默认不开 Keyboard.enableRepeatEvents，所以不能指望系统的按键
+    // 重复事件 —— 自己盯着键位状态计时，按住 Ctrl + +/- 就像按住音量键一样滑。
+
+    /** 当前按住的方向（0 = 没按）。 */
+    private int zoomHoldDir = 0;
+    /** 下一次连发的时刻（毫秒）。 */
+    private long zoomNextAt = 0L;
+
+    @Override
+    public void updateScreen() {
+        super.updateScreen();
+        tickZoomHold();
+    }
+
+    private void tickZoomHold() {
+        int dir = 0;
+        if (Keyboard.isKeyDown(Keyboard.KEY_LCONTROL) || Keyboard.isKeyDown(Keyboard.KEY_RCONTROL)) {
+            boolean up = Keyboard.isKeyDown(Keyboard.KEY_EQUALS) || Keyboard.isKeyDown(Keyboard.KEY_ADD);
+            boolean down = Keyboard.isKeyDown(Keyboard.KEY_MINUS) || Keyboard.isKeyDown(Keyboard.KEY_SUBTRACT);
+            if (up && !down) dir = 1;
+            else if (down && !up) dir = -1;
+        }
+        long now = System.currentTimeMillis();
+        if (dir == 0 || dir != zoomHoldDir) {
+            // 刚按下（或方向变了）：先等 300ms，避免轻点就滑出去
+            zoomHoldDir = dir;
+            zoomNextAt = now + ZOOM_HOLD_DELAY_MS;
+            return;
+        }
+        if (now < zoomNextAt) return;
+        // 看"有效缩放"有没有真的变：到了 50% / 300% 的边界，或者窗口太小已经把
+        // 缩放夹住时，再按也不会变大，就停手（否则会一直弹提示、一直写盘）。
+        double before = guiScaleFactor;
+        zoomBy(dir);
+        if (Math.abs(guiScaleFactor - before) < 1e-6D) {
+            zoomHoldDir = 0;
+        } else {
+            zoomNextAt = now + ZOOM_HOLD_REPEAT_MS;
+        }
+    }
+
+    /** "125%" for a 1.25 factor. */
+    static String pct(double zoom) { return Math.round(zoom * 100.0D) + "%"; }
+
+    /**
+     * Switch the whole UI to a new zoom level: the virtual window shrinks/grows,
+     * every fixed layout metric (and every glyph) is drawn with the same factor,
+     * then the columns are re-fitted. Persisted so the next open keeps it.
+     * 连续百分比：任何 50%..300% 之间的值都可用，窗口太小会自动降档。
+     */
+    void applyZoom(double zoom) {
+        uiZoom = Math.max(NexusConfig.UI_ZOOM_MIN,
+                Math.min(NexusConfig.UI_ZOOM_MAX, Math.round(zoom * 100.0D) / 100.0D));
+        NexusConfig.setUiZoom(uiZoom);
+        guiScaleFactor = zoomFor(mc, uiZoom);
+        // same math as setWorldAndResolution, minus initGui (keeps the open
+        // overlay/view state and only re-runs the layout)
+        width = (int) Math.ceil(mc.displayWidth / guiScaleFactor);
+        height = (int) Math.ceil(mc.displayHeight / guiScaleFactor);
+        fitColumns();
+        relayout();
+        boolean limited = guiScaleFactor < uiZoom - 0.0001D;
+        toast("界面缩放 " + pct(guiScaleFactor) + (limited ? "（窗口太小，已限制）" : ""), 1500);
     }
 
     private void applyFixedProjection() {
         GlStateManager.matrixMode(GL11.GL_PROJECTION);
         GlStateManager.loadIdentity();
-        GlStateManager.ortho(0.0D, mc.displayWidth / (double) guiScaleFactor,
-                mc.displayHeight / (double) guiScaleFactor, 0.0D, 1000.0D, 3000.0D);
+        // 用 width/height（而不是 displayWidth/guiScaleFactor）保证投影边界、鼠标换算
+        // 和 scissor 用的是同一套整数值，分数缩放下不会出现一像素的错位
+        GlStateManager.ortho(0.0D, width, height, 0.0D, 1000.0D, 3000.0D);
         GlStateManager.matrixMode(GL11.GL_MODELVIEW);
         GlStateManager.loadIdentity();
         GlStateManager.translate(0.0F, 0.0F, -2000.0F);
@@ -445,9 +563,15 @@ public class NexusScreen extends GuiScreen {
     @Override
     public void drawScreen(int mouseX, int mouseY, float partial) {
         // mouseX/Y arrive in the game's GUI scale — recompute in ours
-        int mx = Mouse.getX() * width / Math.max(1, mc.displayWidth);
-        int my = height - Mouse.getY() * height / Math.max(1, mc.displayHeight) - 1;
+        int mx = (int) Math.floor(Mouse.getX() / guiScaleFactor);
+        int my = (int) Math.floor((mc.displayHeight - Mouse.getY()) / guiScaleFactor);
+        if (mx < 0) mx = 0; else if (mx >= width) mx = width - 1;
+        if (my < 0) my = 0; else if (my >= height) my = height - 1;
         applyFixedProjection();
+        // 一个虚拟像素对应多少设备像素：高清字体按这个比例栅格化字形，缩放多少都清晰
+        if (width > 0) {
+            com.mythos.nexus.ui.text.NexusFont.setScale(mc.displayWidth / (double) width);
+        }
         try {
             drawScreenFixed(mx, my, partial);
         } finally {
@@ -1195,12 +1319,18 @@ public class NexusScreen extends GuiScreen {
     public void handleMouseInput() throws IOException {
         super.handleMouseInput();
         int d = Mouse.getEventDWheel();
+        // Ctrl + 滚轮 = 连续缩放（每次 5%），优先于任何列表滚动
+        if (d != 0 && (Keyboard.isKeyDown(Keyboard.KEY_LCONTROL)
+                || Keyboard.isKeyDown(Keyboard.KEY_RCONTROL))) {
+            zoomBy(d > 0 ? 1 : -1);
+            return;
+        }
         if (d != 0 && overlayPanel != null) {
             if ("palette".equals(overlayPanel)) palette.scroll(d);
             return;
         }
         if (d != 0) {
-            int mx = Mouse.getEventX() * width / mc.displayWidth;
+            int mx = (int) Math.floor(Mouse.getEventX() / guiScaleFactor);
             int cx = railW + SPLIT_W;
             int rx = width - rightW;
             if (mx >= width - ICON_STRIP && scrollIcons(d)) return;

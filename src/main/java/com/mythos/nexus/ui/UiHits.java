@@ -37,10 +37,14 @@ final class UiHits {
     }
 
     static void scissor(NexusScreen s, int x, int y, int w, int h) {
-        int scale = s.guiScaleFactor;
+        // 缩放是连续百分比（double），裁剪框必须用同一套取整规则，否则
+        // 分数缩放下边框会差一像素
+        double scale = s.guiScaleFactor;
         GL11.glEnable(GL11.GL_SCISSOR_TEST);
-        GL11.glScissor(x * scale, s.mc().displayHeight - (y + h) * scale,
-                Math.max(0, w * scale), Math.max(0, h * scale));
+        GL11.glScissor((int) Math.round(x * scale),
+                (int) Math.round(s.mc().displayHeight - (y + h) * scale),
+                Math.max(0, (int) Math.round(w * scale)),
+                Math.max(0, (int) Math.round(h * scale)));
     }
 
     static void endScissor() { GL11.glDisable(GL11.GL_SCISSOR_TEST); }

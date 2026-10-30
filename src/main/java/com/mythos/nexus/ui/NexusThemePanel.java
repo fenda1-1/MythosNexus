@@ -386,31 +386,57 @@ final class NexusThemePanel extends NexusPanel {
 
     /** "导入" — read clipboard, parse strict JSON, load as editingTheme. */
     private void onImport() {
-        try {
-            Clipboard cb = Toolkit.getDefaultToolkit().getSystemClipboard();
-            String json = (String) cb.getData(DataFlavor.stringFlavor);
-            NexusTheme.Preset p = NexusTheme.parseThemeJson(json);
-            if (p == null) { s.toast("剪贴板内容不是有效主题 JSON", 2000); return; }
-            // Load into live fields so the editor shows it immediately
-            NexusTheme.apply(p);
-            editingThemeId = p.id;
-            editingThemeName = p.name;
-            editingKey = null;
-        } catch (Exception e) {
-            s.toast("剪贴板读取失败", 2000);
-        }
+        CLIPBOARD.execute(() -> {
+            final String json;
+            try {
+                Clipboard cb = Toolkit.getDefaultToolkit().getSystemClipboard();
+                json = (String) cb.getData(DataFlavor.stringFlavor);
+            } catch (Throwable e) {
+                onClient(() -> s.toast("剪贴板读取失败", 2000));
+                return;
+            }
+            onClient(() -> {
+                NexusTheme.Preset p = NexusTheme.parseThemeJson(json);
+                if (p == null) { s.toast("剪贴板内容不是有效主题 JSON", 2000); return; }
+                // Load into live fields so the editor shows it immediately
+                NexusTheme.apply(p);
+                editingThemeId = p.id;
+                editingThemeName = p.name;
+                editingKey = null;
+            });
+        });
+    }
+
+    /** Clipboard work runs on Nexus-Clipboard, never on the client thread:
+     *  Windows blocks getSystemClipboard() while another process holds the
+     *  clipboard open, and a blocked render thread is an unrecoverable freeze
+     *  (Minecraft keeps ticking nothing). Results hop back with
+     *  addScheduledTask, which is drained on the client thread each frame. */
+    private static final java.util.concurrent.ExecutorService CLIPBOARD =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "Nexus-Clipboard");
+                t.setDaemon(true);
+                return t;
+            });
+
+    private static void onClient(Runnable r) {
+        net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getMinecraft();
+        if (mc == null) return;
+        mc.addScheduledTask(r);
     }
 
     /** "AI 生成" — copy the strict prompt to clipboard for the user to paste
      *  into their AI; the AI's JSON answer is then imported via 导入. */
     private void onAiPrompt() {
-        try {
-            Toolkit.getDefaultToolkit().getSystemClipboard()
-                    .setContents(new StringSelection(NexusTheme.AI_FORMAT_PROMPT), null);
-            s.toast("提示词已复制 — 贴给 AI 后用 [导入] 读回结果", 2500);
-        } catch (Exception e) {
-            s.toast("复制失败", 2000);
-        }
+        CLIPBOARD.execute(() -> {
+            try {
+                Toolkit.getDefaultToolkit().getSystemClipboard()
+                        .setContents(new StringSelection(NexusTheme.AI_FORMAT_PROMPT), null);
+                onClient(() -> s.toast("提示词已复制 — 贴给 AI 后用 [导入] 读回结果", 2500));
+            } catch (Throwable e) {
+                onClient(() -> s.toast("复制失败", 2000));
+            }
+        });
     }
 
     /** Persist current palette as the new/edited custom theme. */

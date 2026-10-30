@@ -266,4 +266,15 @@ public final class NexusCtx {
         if (s != null) s.savedThirdPersonView = v;
         else ((net.minecraft.client.settings.GameSettings) gameSettings).thirdPersonView = v;
     }
+
+    /** Head of Minecraft.getConnection() (func_147114_u) on a bot thread:
+     *  vanilla reads the real mc.player.connection, i.e. the MOUNTED
+     *  session's handler.  Return the bound session's own handler instead. */
+    public static net.minecraft.client.network.NetHandlerPlayClient getConnection() {
+        BotSession s = LOCAL.get();
+        if (s == null) return null;
+        if (s.handler != null) return s.handler;
+        EntityPlayerSP p = s.player;
+        return p != null ? p.connection : null;
+    }
 }

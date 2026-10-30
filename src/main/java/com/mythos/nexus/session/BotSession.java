@@ -20,10 +20,6 @@ import java.util.Deque;
  * Exactly one session may be "mounted" — the one written into the Minecraft
  * singleton fields. Mounted session renders and receives input; the rest are
  * packet-fed background state.
- *
- * The mount-context machinery (singleton field swapping) lives in
- * {@link SessionContext} — this class keeps the session state and thin
- * delegates that preserve the public API.
  */
 public class BotSession {
 
@@ -138,20 +134,30 @@ public class BotSession {
      *  that mutates PathingControlManager.processes. Drained once per tick by
      *  BotTicker.tickOnce after the packet pump, inside the bound NexusCtx, so
      *  single-threaded-iteration assumptions inside MythosScript/Baritone
-     *  hold. Same serialization guarantee the old client-thread loop had. */
-    public final java.util.concurrent.ConcurrentLinkedQueue<Runnable> taskQueue =
-            new java.util.concurrent.ConcurrentLinkedQueue<>();
+     *  hold. Same serialization guarantee the old client-thread loop had.
+     *
+     *  Bounded: an unbounded queue would grow forever whenever the ticker
+     *  stopped (mounted session, dead thread) while callers kept submitting,
+     *  and a queued task holds an arbitrary caller closure — that is a leak
+     *  that ends in OOM, which takes the whole process down instead of one
+     *  session. Each rejected task fails its own future, so the caller sees
+     *  "queue full" instead of hanging. */
+    /** See the field javadoc: deliberately small — a healthy ticker drains
+     *  this every 50ms, so 1024 already means "thousands of tasks behind". */
+    private static final int MAX_QUEUED_TASKS = 1024;
+
+    public final java.util.concurrent.BlockingQueue<Runnable> taskQueue =
+            new java.util.concurrent.ArrayBlockingQueue<>(MAX_QUEUED_TASKS);
 
     /**
-     * Enqueue r to run on this session's own tick thread and block the caller
-     * until it completes (bounded by timeoutMs). Used by MCP/session tools so
-     * cross-thread state mutations (Baritone processes, kill-aura, feature
-     * managers) happen on the session's own thread instead of racing the tick.
+     * Enqueue r to run on this session's own tick thread; the returned Future
+     * completes when it has. Used by MCP/session tools so cross-thread state
+     * mutations (Baritone processes, kill-aura, feature managers) happen on the
+     * session's own thread instead of racing the tick.
      *
-     * Returns the runnable's outcome via {@code Future}. If this session has
-     * no live ticker (mounted / human / offline) the task runs inline on the
-     * calling thread inside withContext — those contexts already serialize on
-     * the client thread, so inline is correct and avoids a deadlock.
+     * If this session has no live ticker (mounted / human / offline) the task
+     * runs inline on the calling thread inside withContext — those contexts
+     * already serialize on the client thread, so inline avoids a deadlock.
      */
     public java.util.concurrent.Future<?> runOnTick(Runnable r) {
         Thread t = ticker;
@@ -167,10 +173,22 @@ public class BotSession {
         }
         java.util.concurrent.CompletableFuture<Void> fut =
                 new java.util.concurrent.CompletableFuture<>();
-        taskQueue.offer(() -> {
+        boolean accepted = taskQueue.offer(() -> {
             try { r.run(); fut.complete(null); }
             catch (Throwable th) { fut.completeExceptionally(th); }
         });
+        if (!accepted) {
+            // Ticker alive but not draining (or the 256-per-tick budget is
+            // losing against the submission rate). Fail this call loudly —
+            // silently dropping would leave the caller waiting on a future
+            // that never completes.
+            fut.completeExceptionally(new IllegalStateException(
+                    "会话 " + username + " 的任务队列已满（" + MAX_QUEUED_TASKS
+                            + "），tick 线程可能已停止处理"));
+            com.mythos.nexus.core.NexusRefs.warnOnce("session:taskQueueFull:" + username,
+                    "session {} task queue full ({} pending) — ticker is not draining",
+                    username, MAX_QUEUED_TASKS);
+        }
         return fut;
     }
 
@@ -231,19 +249,10 @@ public class BotSession {
         SessionContext.restoreRenderGlobal(mc, fallbackWorld);
     }
 
-    /**
-     * Write this session's world/player/controller/renderViewEntity into the
-     * Minecraft singleton permanently (no auto-restore). Returns nothing —
-     * the displaced objects are captured by the caller if it wants to keep
-     * them (e.g. human session stores them before a bot mounts).
-     */
+    /** Writes this session's fields into the singleton; see {@link SessionContext}. */
     public void persistIntoMinecraft() { ctx.persistIntoMinecraft(); }
 
-    /**
-     * Snapshot the current Minecraft singleton fields INTO this session
-     * (used to stash the human player's context before a bot takes over, or
-     * to re-capture a bot's fields after respawn).
-     */
+    /** Stashes the singleton's current fields into this session; see {@link SessionContext}. */
     public void captureFromMinecraft() { ctx.captureFromMinecraft(); }
 
     /** Called when this session becomes the visible one. */
@@ -347,8 +356,29 @@ public class BotSession {
             lastTicker = t;
             tickerStopRequested = true;   // tell the loop to exit, not just wake
             t.interrupt();                // wake the sleep so it exits promptly
+            // Wait for the worker to leave its current tick. Returning while
+            // it is still inside a hook let the caller (completeMount) swap
+            // this session into the mc singleton while the bot thread kept
+            // mutating the same player -> concurrent setSprinting on one
+            // attribute map ("Modifier is already applied on this attribute!").
+            // The worker checks ownership between every phase/hook, so it
+            // exits quickly; the timeout only bounds a hook that blocks.
+            if (t != Thread.currentThread()) {
+                try {
+                    t.join(TICKER_STOP_JOIN_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                if (t.isAlive()) {
+                    NexusPlugin.LOGGER.warn("ticker {} did not stop within {} ms",
+                            t.getName(), TICKER_STOP_JOIN_MS);
+                }
+            }
         }
     }
+
+    /** Upper bound for stopTicker() waiting on the worker thread. */
+    private static final long TICKER_STOP_JOIN_MS = 1000L;
 
     public void addChat(ITextComponent c) {
         String s = c == null ? "" : c.getFormattedText();

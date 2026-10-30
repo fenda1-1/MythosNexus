@@ -26,6 +26,11 @@ sourceCompatibility = targetCompatibility = compileJava.sourceCompatibility = co
 
 tasks.withType(JavaCompile) {
     options.encoding = "UTF-8"
+    // 这套 mod 运行在 Java 8 上，但构建机上的 javac 可能是 21：只设 source/target 时
+    // javac 仍然对着自己的平台类做方法绑定，一旦用到 Java 9+ 才有的重载（典型是
+    // ByteBuffer.flip() 的协变返回），编出来在 1.8 客户端就 NoSuchMethodError。
+    // --release 8 会改用 JDK 8 的 API 签名来编译，从编译期就挡住这类问题。
+    options.release = 8
 }
 
 repositories {

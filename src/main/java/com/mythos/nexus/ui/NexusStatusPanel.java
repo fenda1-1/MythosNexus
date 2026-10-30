@@ -121,11 +121,11 @@ final class NexusStatusPanel extends NexusPanel {
 
         // enable scissor for the list area
         // the screen's fixed scale, not the game's ScaledResolution
-        int scale = s.guiScaleFactor;
+        double scale = s.guiScaleFactor;
         org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_SCISSOR_TEST);
-        org.lwjgl.opengl.GL11.glScissor((rx + PAD) * scale,
-                s.mc().displayHeight - (listTop + listH) * scale,
-                w * scale, listH * scale);
+        org.lwjgl.opengl.GL11.glScissor((int) Math.round((rx + PAD) * scale),
+                (int) Math.round(s.mc().displayHeight - (listTop + listH) * scale),
+                (int) Math.round(w * scale), (int) Math.round(listH * scale));
 
         int ey = listTop - entityScroll;
         for (Ent e : cached) {

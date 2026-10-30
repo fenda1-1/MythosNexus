@@ -129,6 +129,7 @@ final class NexusScriptPanel extends NexusPanel {
 
         UiHits.scissor(s, rx, top, s.panelW(), viewH);
         int yy = top - scroll;
+        yy = drawAutos(x, w, yy, top, bottom, mx, my, ts);
         yy = drawTree(x, w, yy, top, bottom, mx, my);
         yy += 6;
         yy = drawAccounts(x, w, yy, top, bottom, mx, my);
@@ -179,6 +180,67 @@ final class NexusScriptPanel extends NexusPanel {
                     yy = seqRow(x, w, yy, top, bottom, mx, my, indent, q, runCount.getOrDefault(q.name, 0));
             }
         }
+        return yy;
+    }
+
+    /** 自动化分组的目标：选中的账号，没有选中就用本体（至少能读到一个真实状态）。 */
+    private List<BotSession> autoTargets(List<BotSession> ts) {
+        if (!ts.isEmpty()) return ts;
+        List<BotSession> one = new ArrayList<>();
+        BotSession h = SessionManager.get().humanSession();
+        if (h != null) one.add(h);
+        return one;
+    }
+
+    /** 自动化分组：MythosScript 各功能的总开关，点一下对全部目标账号切换。 */
+    private int drawAutos(int x, int w, int yy, int top, int bottom, int mx, int my, List<BotSession> all) {
+        List<MythosScripts.Auto> as = MythosScripts.autos();
+        if (as.isEmpty()) return yy;
+        List<BotSession> ts = autoTargets(all);
+        MythosScripts.refreshAutos(ts);
+
+        int on = 0;
+        for (MythosScripts.Auto a : as) if (MythosScripts.autoCounts(ts, a)[0] > 0) on++;
+
+        String gk = "auto:-";
+        boolean open = !expanded.contains(gk);
+        boolean ghov = my >= top && my < bottom && hit(mx, my, x, yy, w, ROW);
+        if (ghov) Ui.roundedRect(x, yy, w, ROW, 3, NexusTheme.HOVER_WASH);
+        s.font().drawString(open ? "▾" : "▸", x + 2, yy + 4, NexusTheme.TEXT_SUB);
+        s.font().drawString("自动化 " + on + "/" + as.size(), x + 12, yy + 4,
+                ghov ? NexusTheme.TEXT_TITLE : NexusTheme.TEXT_SUB);
+        hits.addClipped(x, yy, w, ROW, top, bottom, () -> toggle(gk));
+        yy += STEP + 2;
+
+        if (open) {
+            for (MythosScripts.Auto a : as) {
+                int[] c = MythosScripts.autoCounts(ts, a);
+                boolean hov = my >= top && my < bottom && hit(mx, my, x, yy, w, ROW);
+                boolean allOn = c[1] > 0 && c[0] == c[1];
+                if (allOn) Ui.roundedRect(x, yy, w, ROW, 3, NexusTheme.BG_CARD_HOV);
+                if (hov) Ui.roundedRect(x, yy, w, ROW, 3, NexusTheme.HOVER_WASH);
+                Ui.dot(x + 5, yy + 8, c[0] > 0 ? NexusTheme.ACCENT : NexusTheme.IDLE);
+                String badge = c[1] == 0 ? "?" : (c[0] == 0 ? "关" : (allOn ? "开" : "开 " + c[0] + "/" + c[1]));
+                int bwid = s.font().getStringWidth(badge);
+                int bcol = c[0] == 0 ? NexusTheme.TEXT_FAINT : (allOn ? NexusTheme.ACCENT : NexusTheme.WARN);
+                s.font().drawString(s.font().trimStringToWidth(a.label, w - 24 - bwid - 8), x + 12, yy + 4,
+                        hov ? NexusTheme.TEXT_TITLE : NexusTheme.TEXT_LABEL);
+                s.font().drawString(badge, x + w - bwid - 4, yy + 4, bcol);
+                if (hov) {
+                    s.hoverText = a.label + "\n" + a.tip
+                            + (ts.isEmpty() ? "\n当前没有在线的目标账号" : "\n左键: 对 " + ts.size() + " 个目标账号切换");
+                    s.hoverX = mx; s.hoverY = my;
+                }
+                hits.addClipped(x, yy, w, ROW, top, bottom, () -> {
+                    boolean now = MythosScripts.toggleAuto(autoTargets(targets()), a);
+                    s.toast(a.label + (now ? " 已开启" : " 已关闭"), 1500);
+                });
+                yy += STEP;
+            }
+        }
+        yy += 2;
+        Ui.divider(x, yy, w);
+        yy += 4;
         return yy;
     }
 

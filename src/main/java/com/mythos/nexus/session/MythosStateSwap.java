@@ -102,12 +102,9 @@ public final class MythosStateSwap {
      */
     private static final java.util.Set<String> PER_SESSION_FIELDS =
         new java.util.HashSet<>();
-    // All runtime toggle fields have been boxed into each handler's
-    // RuntimeState (non-static, keyed by session inside MythosScript), so
-    // every former entry here pointed at a field that no longer exists as
-    // a static — dead entries. Stash now only manages static config fields;
-    // the set stays (empty) in case a future static runtime toggle needs
-    // per-session treatment again.
+    // Empty since runtime toggles moved into each handler's non-static
+    // RuntimeState; kept for a future static toggle that needs per-session
+    // treatment.
 
     /** The MythosScript ProfileManager static we redirect per-session. */
     private static final String PROFILE_MANAGER = NexusRefs.PROFILE_MANAGER;
@@ -268,13 +265,74 @@ public final class MythosStateSwap {
     }
 
 
+    /** Serialises whole statics sections.
+     *  STASH_LOCK only guards the stash maps; the live statics themselves
+     *  (`s.field.set`) and repopulate()'s clear()+putAll() ran with no lock at
+     *  all, so a client-thread mount could interleave with a scoped
+     *  withStatics() call on a Nexus-Script pool thread and leave a session
+     *  reading another session's toggles (a container that is briefly empty,
+     *  or half of one session's map). Reentrant because withStatics holds it
+     *  across its two swapToLocked calls, and lock order is always
+     *  SWAP_LOCK -> STASH_LOCK.
+     *
+     *  Bounded wait, never blocking: the client thread calls swapTo while
+     *  mounting, and a scoped script body may hold this lock for as long as it
+     *  runs. Waiting for that would freeze the game, so a timed-out acquire
+     *  proceeds unlocked and says so — that is the pre-existing (unlocked)
+     *  behaviour, whereas the normal uncontended case is now correct. */
+    private static final java.util.concurrent.locks.ReentrantLock SWAP_LOCK =
+            new java.util.concurrent.locks.ReentrantLock();
+    private static final long SWAP_WAIT_MS = 500L;
+    /** Per-thread degradation depth: once a thread gives up on the lock, nested
+     *  calls on that thread must not each pay the timeout again. */
+    private static final ThreadLocal<int[]> SWAP_DEGRADED = new ThreadLocal<>();
+
+    private static boolean lockSwap(String where) {
+        int[] skip = SWAP_DEGRADED.get();
+        if (skip != null && skip[0] > 0) {
+            skip[0]++;
+            return false;
+        }
+        try {
+            if (SWAP_LOCK.tryLock(SWAP_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                return true;
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+        SWAP_DEGRADED.set(new int[] {1});
+        NexusRefs.warnOnce("swap:busy:" + where,
+                "MythosStateSwap.{}: swap lock busy >{}ms on {}, proceeding without it "
+                        + "(statics may mix with the session holding it)",
+                where, SWAP_WAIT_MS, Thread.currentThread().getName());
+        return false;
+    }
+
+    private static void unlockSwap(boolean locked) {
+        if (locked) {
+            SWAP_LOCK.unlock();
+            return;
+        }
+        int[] skip = SWAP_DEGRADED.get();
+        if (skip != null && --skip[0] <= 0) SWAP_DEGRADED.remove();
+    }
+
     /**
-     * Snapshot the live statics for `outgoing` (the session being unmounted),
-     * then restore `incoming`'s stash (or defaults for a fresh session).
-     * Called on the client thread inside SessionManager.mount() AFTER the
-     * Minecraft fields are already swapped.
+     * Snapshot the live statics for {@code outgoing} (the session being
+     * unmounted), then restore {@code incoming}'s stash (or defaults for a
+     * fresh session). Called on the client thread inside SessionManager.mount()
+     * AFTER the Minecraft fields are already swapped.
      */
     public static void swapTo(BotSession outgoing, BotSession incoming) {
+        boolean locked = lockSwap("swapTo");
+        try {
+            swapToLocked(outgoing, incoming);
+        } finally {
+            unlockSwap(locked);
+        }
+    }
+
+    private static void swapToLocked(BotSession outgoing, BotSession incoming) {
         ensureBuilt();
         if (SLOTS == null || SLOTS.isEmpty()) return;
 
@@ -427,6 +485,15 @@ public final class MythosStateSwap {
      *  never ran a scoped statics call) holds no membership — the group
      *  stash then persists untouched. */
     public static void clearSession(BotSession s) {
+        boolean locked = lockSwap("clearSession");
+        try {
+            clearSessionLocked(s);
+        } finally {
+            unlockSwap(locked);
+        }
+    }
+
+    private static void clearSessionLocked(BotSession s) {
         if (s == null) return;
         synchronized (STASH_LOCK) {
             Object key = SESSION_KEY.get(s);
@@ -443,6 +510,15 @@ public final class MythosStateSwap {
      * Reentrant-safe: if target is already live, just runs r.
      */
     public static void withStatics(BotSession target, Runnable r) {
+        boolean locked = lockSwap("withStatics");
+        try {
+            withStaticsLocked(target, r);
+        } finally {
+            unlockSwap(locked);
+        }
+    }
+
+    private static void withStaticsLocked(BotSession target, Runnable r) {
         ensureBuilt();
         if (SLOTS == null || SLOTS.isEmpty() || target == liveSession) {
             r.run();
@@ -466,6 +542,15 @@ public final class MythosStateSwap {
      * Deep-copies mutable containers like stashPut does.
      */
     public static void pushLiveToAllStashes(String className) {
+        boolean locked = lockSwap("pushLiveToAllStashes");
+        try {
+            pushLiveToAllStashesLocked(className);
+        } finally {
+            unlockSwap(locked);
+        }
+    }
+
+    private static void pushLiveToAllStashesLocked(String className) {
         ensureBuilt();
         if (SLOTS == null || SLOTS.isEmpty()) return;
         synchronized (STASH_LOCK) {

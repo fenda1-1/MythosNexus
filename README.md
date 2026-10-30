@@ -206,7 +206,7 @@ Mythos Nexus 是 **[MythosScript](https://github.com/fenda1-1/MythosScript) 的�
 | 当前版本 | **0.1** |
 
 1. 准备一个 Minecraft 1.12.2 的 Forge 游戏环境，使用 Java 8 启动。
-2. 把构建出的 `Mythos-Nexus-v0.1-mc-1.12.2.jar` 放进该实例的 `mods` 文件夹。
+2. 把 `Mythos-Nexus-v0.1-mc-1.12.2.jar` 放进该实例的 `mods` 文件夹。仓库 `dist/` 目录里有现成的编译包，也可以自己构建（产物同名）。
 3. 进入游戏后按 `Z` 打开账号管理，在右侧面板填入用户名与服务器地址，点「添加账号」。
 4. 需要多开时重复上一步。每个账号连上后都会出现在卡片区，点卡片可以切过去接管，再点回来继续自己的事。
 5. 需要定制时，进「Tick」面板调整 CPU 上限与优先级，进「代理」面板为不同账号分配出口。
@@ -236,6 +236,8 @@ Mythos Nexus 是 **[MythosScript](https://github.com/fenda1-1/MythosScript) 的�
 ```
 
 完成后可在 `build/libs/` 找到 `Mythos-Nexus-v0.1-mc-1.12.2.jar`。这是同时包含 coremod 入口与普通 mod 的单一包，直接放入 `mods` 即可。
+
+`dist/` 里存的是每次发布时与源码同版本的预编译包，配 `checksums.txt` 里的 SHA-1；不想自己构建就直接用这个。
 
 本项目是 coremod：JAR 的 manifest 里声明了 `FMLCorePlugin: com.mythos.nexus.core.NexusPlugin` 与 `FMLCorePluginContainsFMLMod: true`，因此游戏启动时会在类加载阶段先装上 ASM 转换器，再去加载 mod 本体。请勿修改包内 `META-INF` 与清单字段，否则注入点会失效。
 

@@ -91,6 +91,12 @@ public final class NexusConfig {
         String liveViewSize = "320x180";
         String cardSort = "DEFAULT";
         String cardDensity = "NORMAL";
+        /** Nexus 界面缩放（连续百分比，1.0 = 100% 设计基准）— Ctrl + + / Ctrl + - 调整。 */
+        double uiZoom = UI_ZOOM_DEFAULT;
+        /** 旧版整数缩放（1..4，2 = 基准）。只为读回老配置而保留，新代码用上面那个。 */
+        int uiScale = 2;
+        /** 高清字体（字形图集）。null = 老配置没这个键，按开处理。 */
+        Boolean hdFont = Boolean.TRUE;
         /** group name → 0xRRGGBB color int. */
         Map<String, Integer> groupColors = new HashMap<>();
         /** icon id → pinned to right icon column. */
@@ -514,6 +520,46 @@ public final class NexusConfig {
     public static synchronized String cardDensity() { return root().cardDensity; }
     public static synchronized void setCardDensity(String d) {
         root().cardDensity = d == null ? "NORMAL" : d; save();
+    }
+
+    // ---- 界面缩放 (Ctrl + + / Ctrl + -) ------------------------------------
+    // 整个 Nexus 界面的文字和布局按同一比例缩放：guiScaleFactor 越大，虚拟像素越少，
+    // 每个虚拟像素在屏幕上更大 —— 和原版 GUI scale 的规则完全一致，但这里是连续的
+    // 浮点比例（0.50 ~ 3.00），不是 1/2/3/4 的整数档。
+
+    /** 最小 50%，低于此三栏布局基本没法用；最大 300%，再大一个卡片都放不下。 */
+    public static final double UI_ZOOM_MIN = 0.50D;
+    public static final double UI_ZOOM_MAX = 3.00D;
+    public static final double UI_ZOOM_DEFAULT = 1.00D;
+
+    public static synchronized double uiZoom() {
+        double v = root().uiZoom;
+        if (v <= 0D) {
+            // 老配置里存的是整数档（1..4）：2 = 100%，1 = 50%，3 = 150%，4 = 200%
+            int legacy = root().uiScale;
+            v = (legacy >= 1 && legacy <= 4) ? legacy / 2.0D : UI_ZOOM_DEFAULT;
+        }
+        if (v < UI_ZOOM_MIN) v = UI_ZOOM_MIN;
+        if (v > UI_ZOOM_MAX) v = UI_ZOOM_MAX;
+        return v;
+    }
+
+    public static synchronized void setUiZoom(double zoom) {
+        double z = Math.max(UI_ZOOM_MIN, Math.min(UI_ZOOM_MAX, zoom));
+        // 存成整百分比，重复按 +/- 不会因为浮点误差漂成 99.999%
+        root().uiZoom = Math.round(z * 100.0D) / 100.0D;
+        root().uiScale = (int) Math.round(root().uiZoom * 2.0D);   // 供老版本读回
+        save();
+    }
+
+    /** 高清字体开关：关掉就退回原版 ascii.png，缩放非整数比例时会糊。 */
+    public static synchronized boolean hdFont() {
+        return root().hdFont == null || root().hdFont.booleanValue();
+    }
+
+    public static synchronized void setHdFont(boolean on) {
+        root().hdFont = Boolean.valueOf(on);
+        save();
     }
 
     /** 0xRRGGBB for the group, or null when unset. */

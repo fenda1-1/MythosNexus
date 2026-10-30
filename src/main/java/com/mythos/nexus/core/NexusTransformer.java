@@ -14,18 +14,12 @@ import java.util.HashSet;
 import java.util.Set;
 
 /**
- * Bytecode hooks into net.minecraft.network.NetworkManager:
+ * FML coremod transformer. Rewrites the hot vanilla/mod classes so a bot tick
+ * thread resolves per-session state instead of the shared MC singleton, and
+ * head-guards every path that would touch GL or a shared render object from a
+ * thread that does not own the context.
  *
- *  1. channelRead0(ctx, Packet) — before vanilla dispatch, ask NexusHooks
- *     whether this connection belongs to a bot; if so route the packet
- *     through the owning session's context and RETURN (skip vanilla).
- *
- *  2. setConnectionState(PLAY) — after vanilla sets the handler, ask
- *     NexusHooks to swap in the per-bot handler (bot connections never hit
- *     the vanilla NetHandlerLoginClient path, so we do not need this in v0.1;
- *     kept as a stub for future use).
- *
- * Matching is descriptor-first (stable across srg/mcp) plus a name set.
+ * Matching is descriptor-first (stable across srg/mcp/obf) plus a name set.
  */
 public class NexusTransformer implements IClassTransformer {
 
@@ -47,6 +41,8 @@ public class NexusTransformer implements IClassTransformer {
     private static final String WVBU_CLASS = "net.minecraft.client.renderer.WorldVertexBufferUploader";
     private static final String EPSP_CLASS = "net.minecraft.client.entity.EntityPlayerSP";
     private static final String RM_CLASS   = "net.minecraft.client.renderer.entity.RenderManager";
+    private static final String GSM_CLASS  = "net.minecraft.client.renderer.GlStateManager";
+    private static final String OGH_CLASS  = "net.minecraft.client.renderer.OpenGlHelper";
     private static final String HOOKS = "com/mythos/nexus/core/NexusHooks";
     private static final String HOOKS_INTERNAL = HOOKS.replace('.', '/');
 
@@ -127,7 +123,8 @@ public class NexusTransformer implements IClassTransformer {
                 return pipeGetInstance(transformBotNoop(basicClass, LSR_METHODS, "LoadingScreenRenderer"));
             }
             if (TER_CLASS.equals(transformedName) || "bwx".equals(name)) {
-                return pipeGetInstance(transformBotNoop(basicClass, TER_METHODS, "TileEntityRendererDispatcher"));
+                return pipeGetInstance(transformTileEntityDispatcher(
+                        transformBotNoop(basicClass, TER_METHODS, "TileEntityRendererDispatcher")));
             }
             if (SH_CLASS.equals(transformedName) || "cho".equals(name)) {
                 return pipeGetInstance(transformBotNoop(basicClass, SH_METHODS, "SoundHandler"));
@@ -138,6 +135,26 @@ public class NexusTransformer implements IClassTransformer {
             // is pure visual output; a background bot has nothing to print.
             if (GIC_CLASS.equals(transformedName) || "biq".equals(name)) {
                 return pipeGetInstance(transformBotNoop(basicClass, GIC_METHODS, "GuiIngame"));
+            }
+            // GlStateManager: the single choke point for the whole game's
+            // immediate-mode GL state. Every one of its ~118 public methods
+            // ends in a GL11 call, and a GL11 call from a thread that does not
+            // own the context throws "No OpenGL context found in the current
+            // thread" — which is what kills a bot thread the moment any
+            // third-party mod touches GL state from it. Guarding the class
+            // covers all of them (and every caller) in one place.
+            if (GSM_CLASS.equals(transformedName) || "bus".equals(name)
+                    || transformedName.startsWith(GSM_CLASS + "$")
+                    || name.startsWith("bus$")) {
+                // Nested state classes (BooleanState.setState, Color, …) call
+                // GL11 themselves — guard them with the same rule.
+                return pipeGetInstance(transformGlStateManager(basicClass));
+            }
+            // OpenGlHelper is the second GL choke point (shaders, FBOs, texture
+            // units, GL20 uniforms). Same rule: no context on this thread → the
+            // call would throw, so return the return type's default instead.
+            if (OGH_CLASS.equals(transformedName) || "cii".equals(name)) {
+                return pipeGetInstance(transformGlStateManager(basicClass));
             }
             if (WC_CLASS.equals(transformedName)) {
                 return pipeGetInstance(transformWorldClient(basicClass, transformedName));
@@ -203,19 +220,13 @@ public class NexusTransformer implements IClassTransformer {
     }
 
     //
-    // The 7 singleton fields SessionContext swaps in/out today only work
-    // because the whole tick ran serially on the client thread. With per-bot
-    // tick THREADS the swap can't work — each thread would fight over the
-    // same mc.player field. Instead we rewrite every bytecode access to those
-    // fields inside classes a bot tick can reach, routing it through
-    // NexusCtx which resolves the thread-bound session.
-    //
-    // Only classes reachable during a bot's world tick / packet dispatch /
-    // entity update are listed. Render + GUI classes (EntityRenderer,
-    // GuiIngame, RenderGlobal, ItemRenderer, containers) stay untouched —
-    // they only ever run on the client thread where the real field is
-    // already correct, and rewriting their hot loops would add ThreadLocal
-    // cost for no benefit.
+    // The 7 singleton fields (player/world/playerController/...) only ever
+    // worked because the whole tick ran serially on the client thread. With one
+    // tick THREAD per bot they cannot be swapped in and out — each would fight
+    // over the same field. So every access to them inside classes a bot tick can
+    // reach is rewritten to a NexusCtx accessor that resolves the thread-bound
+    // session. Render/GUI classes stay untouched: they only run on the client
+    // thread, where the real field is already correct.
 
     private static final String CTX_INTERNAL =
             "com/mythos/nexus/session/NexusCtx";
@@ -229,28 +240,18 @@ public class NexusTransformer implements IClassTransformer {
     private static final String ENTITY_PLAYER_CLASS = "net.minecraft.entity.player.EntityPlayer";
 
     /**
-     * Classes whose GETFIELD/PUTFIELD on the 7 fields is rewritten.
-     * Internal names (with package). Minecraft itself is NOT rewritten —
-     * it must keep storing/returning the real mounted-session fields.
-     *
-     * Included: the whole entity tick path (WorldClient, EntityPlayerSP,
-     * Entity, EntityLivingBase, EntityPlayer, PlayerControllerMP, entity
-     * subclasses that override onUpdate or read mc), the network dispatch
-     * classes (NetHandlerPlayClient and its packet handlers — they mutate
-     * mc.world/mc.player via loadWorld + setPlayer spawn), chunk/world
-     * provider, and World/WorldProvider/WorldServer-adjacent helpers.
+     * Classes whose GETFIELD/PUTFIELD on the 7 fields is rewritten: the bot tick
+     * path (entity tick, PlayerControllerMP, WorldClient, chunk/world provider)
+     * plus the SPacket handlers, which run in the bot's packet pump on its own
+     * thread. Minecraft itself is NOT rewritten — it must keep storing and
+     * returning the real mounted-session fields.
      */
     private static final Set<String> FIELD_CTX_CLASSES = buildFieldCtxSet();
 
     private static Set<String> buildFieldCtxSet() {
-        // Manifest-driven allowlist (see _nexus_read/FIELD_REWRITE_MANIFEST.md).
-        // The audit found the bot-tick path reads mc.player/mc.world/
-        // mc.playerController/mc.currentScreen in only a handful of classes —
-        // everything else that touches those fields is render-only and stays
-        // on the client thread. We rewrite the tick set PLUS the SPacket
-        // handlers (they execute inside the bot's packet pump on its own
-        // thread and can reach the same fields) for safety; a render class
-        // is never in this list, so it always resolves to the real field.
+        // Manifest-driven (see _nexus_read/FIELD_REWRITE_MANIFEST.md): the audit
+        // found the bot-tick path reaches these fields in only a handful of
+        // classes; everything else that touches them is render-only.
         String[] names = {
             "net.minecraft.client.multiplayer.WorldClient",
             "net.minecraft.client.multiplayer.PlayerControllerMP",
@@ -676,8 +677,9 @@ public class NexusTransformer implements IClassTransformer {
     private byte[] transformNetHandlerPlayClient(byte[] in) {
         ClassReader cr = new ClassReader(in);
         ClassWriter cw = writer(cr);
-        final boolean[] patched = {false, false};
+        final boolean[] patched = {false, false, false};
         final int[] rewrites = {0};
+        final int[] hit = {0};
         cr.accept(new ClassVisitor(Opcodes.ASM5, cw) {
             @Override
             public MethodVisitor visitMethod(int access, String mname, String mdesc,
@@ -751,13 +753,50 @@ public class NexusTransformer implements IClassTransformer {
                         }
                     };
                 }
+                // handleSpawnPlayer(SPacketSpawnPlayer): mcp func_147237_a obf a(Lic;)V.
+                // Vanilla does getPlayerInfo(packet.getUniqueId()).getGameProfile()
+                // with NO null check, and the player-list entry is legitimately
+                // absent when SPacketPlayerListItem arrives after the spawn packet
+                // (or was removed by REMOVE_PLAYER on a dimension change). The NPE
+                // aborts the whole handler, so the entity is never registered and
+                // every later SPacketEntity* for that id is dropped as "unknown".
+                // Rewrite just that one call to NexusHooks.spawnPlayerInfo, which
+                // returns the real entry or a placeholder built from the packet's
+                // own UUID. Everything else in the method stays vanilla.
+                if (("(Lic;)V".equals(mdesc) && mname.equals("a"))
+                        || ("(Lnet/minecraft/network/play/server/SPacketSpawnPlayer;)V".equals(mdesc)
+                            && (mname.equals("handleSpawnPlayer") || mname.equals("func_147237_a")))) {
+                    patched[2] = true;
+                    return new MethodVisitor(Opcodes.ASM5, mv) {
+                        @Override
+                        public void visitMethodInsn(int opcode, String owner, String iname,
+                                                    String idesc, boolean itf) {
+                            boolean info = idesc != null
+                                    && idesc.startsWith("(Ljava/util/UUID;)")
+                                    && (iname.equals("getPlayerInfo")
+                                        || iname.equals("func_175102_a")
+                                        || iname.equals("a"))
+                                    && (idesc.endsWith("Lbsc;")
+                                        || idesc.endsWith("Lnet/minecraft/client/network/NetworkPlayerInfo;"));
+                            if (!info) { super.visitMethodInsn(opcode, owner, iname, idesc, itf); return; }
+                            // return type of the original call, e.g. "Lbsc;"
+                            String ret = idesc.substring(idesc.indexOf(')') + 1);
+                            mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                                    "spawnPlayerInfo",
+                                    "(Ljava/lang/Object;Ljava/util/UUID;)Ljava/lang/Object;", false);
+                            mv.visitTypeInsn(Opcodes.CHECKCAST, ret.substring(1, ret.length() - 1));
+                            hit[0]++;
+                        }
+                    };
+                }
                 return mv;
             }
         }, 0);
         if (!patched[0]) NexusPlugin.LOGGER.warn("NetHandlerPlayClient.<init> not patched — sessions won't auto-register");
         if (!patched[1]) NexusPlugin.LOGGER.warn("NetHandlerPlayClient.onDisconnect not patched — bot disconnects will corrupt the mounted session");
-        NexusPlugin.LOGGER.info("[xform] NetHandlerPlayClient fieldctx rewrites={}", rewrites[0]);
-        return (patched[0] || patched[1] || rewrites[0] > 0) ? cw.toByteArray() : in;
+        if (!patched[2]) NexusPlugin.LOGGER.warn("NetHandlerPlayClient.handleSpawnPlayer not patched — a missing player-list entry will NPE the spawn packet");
+        NexusPlugin.LOGGER.info("[xform] NetHandlerPlayClient fieldctx rewrites={} spawnInfoGuards={}", rewrites[0], hit[0]);
+        return (patched[0] || patched[1] || patched[2] || rewrites[0] > 0) ? cw.toByteArray() : in;
     }
 
 
@@ -919,6 +958,50 @@ public class NexusTransformer implements IClassTransformer {
                     };
                 }
 
+                // resize/updateDisplay write the shared window geometry and pump
+                // LWJGL's message loop + buffer swap, all illegal off the window's
+                // owning thread. DragonCore's ol.m(int,int) reaches them from a bot
+                // thread: measured display=1024x640 while the framebuffer stayed
+                // 854x480, then updateDisplay threw "No context is current". Defer
+                // both through the same FIFO as the Display.setXxx hooks.
+                // mcp resize  srg func_71370_a  (II)V
+                if ("(II)V".equals(mdesc)
+                        && (mname.equals("resize") || mname.equals("func_71370_a"))) {
+                    patched[0]++;
+                    return new MethodVisitor(Opcodes.ASM5, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            mv.visitVarInsn(Opcodes.ALOAD, 0);           // this (Minecraft)
+                            mv.visitVarInsn(Opcodes.ILOAD, 1);
+                            mv.visitVarInsn(Opcodes.ILOAD, 2);
+                            mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                                    "resizeGuard", "(Ljava/lang/Object;II)Z", false);
+                            Label cont = new Label();
+                            mv.visitJumpInsn(Opcodes.IFEQ, cont);
+                            mv.visitInsn(Opcodes.RETURN);
+                            mv.visitLabel(cont);
+                        }
+                    };
+                }
+
+                // mcp updateDisplay  srg func_175601_h  ()V
+                if ("()V".equals(mdesc)
+                        && (mname.equals("updateDisplay") || mname.equals("func_175601_h"))) {
+                    patched[0]++;
+                    return new MethodVisitor(Opcodes.ASM5, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            mv.visitVarInsn(Opcodes.ALOAD, 0);           // this (Minecraft)
+                            mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                                    "updateDisplayGuard", "(Ljava/lang/Object;)Z", false);
+                            Label cont = new Label();
+                            mv.visitJumpInsn(Opcodes.IFEQ, cont);
+                            mv.visitInsn(Opcodes.RETURN);
+                            mv.visitLabel(cont);
+                        }
+                    };
+                }
+
                 //     a legal "play" thread so checkThreadAndEnqueue doesn't
                 //     bounce every server packet back onto the client thread ---
                 // Vanilla: return Thread.currentThread() == this.mcThread.
@@ -951,6 +1034,32 @@ public class NexusTransformer implements IClassTransformer {
                             mv.visitJumpInsn(Opcodes.IFEQ, cont);
                             mv.visitInsn(Opcodes.ICONST_1);
                             mv.visitInsn(Opcodes.IRETURN);
+                            mv.visitLabel(cont);
+                        }
+                    };
+                }
+
+                // --- getConnection: bot threads must get their OWN handler ---
+                // Vanilla: return this.player == null ? null : this.player.connection;
+                // `this.player` is the real (mounted) field, so any mod calling
+                // mc.getConnection() from a bot tick would send through the
+                // mounted session's connection.
+                // mcp getConnection  srg func_147114_u  obf v  ()NetHandlerPlayClient / ()Lbrz;
+                if (("()Lnet/minecraft/client/network/NetHandlerPlayClient;".equals(mdesc)
+                                && (mname.equals("getConnection") || mname.equals("func_147114_u")))
+                        || ("()Lbrz;".equals(mdesc) && mname.equals("v"))) {
+                    patched[0]++;
+                    return new MethodVisitor(Opcodes.ASM5, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            mv.visitMethodInsn(Opcodes.INVOKESTATIC, CTX_INTERNAL,
+                                    "onBotThread", "()Z", false);
+                            Label cont = new Label();
+                            mv.visitJumpInsn(Opcodes.IFEQ, cont);
+                            mv.visitMethodInsn(Opcodes.INVOKESTATIC, CTX_INTERNAL,
+                                    "getConnection",
+                                    "()Lnet/minecraft/client/network/NetHandlerPlayClient;", false);
+                            mv.visitInsn(Opcodes.ARETURN);
                             mv.visitLabel(cont);
                         }
                     };
@@ -1124,8 +1233,8 @@ public class NexusTransformer implements IClassTransformer {
                             mv.visitJumpInsn(Opcodes.IFEQ, cont);
                             mv.visitInsn(Opcodes.RETURN);
                             mv.visitLabel(cont);
-                            // 每帧开头补一次 RenderManager.renderViewEntity，
-                            // 已非 null 时只做一次反射读。
+                            // 每帧开头补齐 RenderManager / TileEntityRendererDispatcher
+                            // 的渲染状态字段，已非 null 时只做反射读。
                             mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
                                     "fillRenderViewEntity", "()V", false);
                         }
@@ -1272,39 +1381,116 @@ public class NexusTransformer implements IClassTransformer {
     }
 
     /**
-     * Rewrite every `INVOKESTATIC Tessellator.getInstance()` call in a class to
-     * `INVOKESTATIC NexusHooks.tessellatorForThread()`. getInstance() is the
-     * only producer of the process-wide Tessellator singleton; routing it
-     * through the hook lets a bound bot thread receive its own ThreadLocal
-     * Tessellator so two threads can never begin() the same BufferBuilder.
-     * Returns the rewritten bytes when at least one call site was replaced,
-     * else null so the caller can fall through to the original bytes.
+     * Guard every method of GlStateManager — and of its nested state classes —
+     * with a head check on the owning thread:
+     * ```
+     * if (glCallGuard()) return <default>;   // not the client thread
+     * ```
+     * GlStateManager is the single choke point for the game's immediate-mode GL
+     * state: every one of its ~120 methods ends in a GL11 call, and it is also
+     * what third-party mods call first. On a thread that does not own the GL
+     * context those calls throw
+     * "RuntimeException: No OpenGL context found in the current thread"
+     * (or "IllegalStateException: No context is current" for Display.update),
+     * which kills the caller — a bot tick thread dies, or worse, the exception
+     * escapes into the packet pump. There is no context to change there, so
+     * returning the return type's default is the only meaningful behaviour, and
+     * it also protects the client thread's cached state from being overwritten
+     * with values that were never applied.
      *
-     * Uses COMPUTE_MAXS (not COMPUTE_FRAMES): the rewrite swaps one
-     * INVOKESTATIC ()L…/Tessellator; for another with the identical return
-     * type, so the stack shape is unchanged and the ORIGINAL stackmap frames
-     * stay valid. Recomputing frames would be actively harmful here — this
-     * transform runs on obfuscated jars whose callers reference mcp-named
-     * types (Entity/EntityLivingBase) that are NOT on the transform-time
-     * classpath, so getCommonSuperClass can't resolve their hierarchy and
-     * falls back to java/lang/Object. The emitted frame then declares a
-     * local as Object where the bytecode later does `invokevirtual Entity.x()`
-     * → VerifyError: Bad type on operand stack (KillAuraHandler.f crash).
+     * Only non-client threads are affected: on the client thread (and during
+     * startup, before the client thread is known) the check is false and every
+     * method executes byte-for-byte as vanilla. Constructors and <clinit> are
+     * left alone — they only build the cached state objects, never touch GL.
      */
+    private byte[] transformGlStateManager(byte[] in) {
+        ClassReader cr = new ClassReader(in);
+        ClassWriter cw = writer(cr);
+        final int[] guarded = {0};
+        cr.accept(new ClassVisitor(Opcodes.ASM5, cw) {
+            @Override
+            public MethodVisitor visitMethod(int access, String mname, String mdesc,
+                                             String sig, String[] ex) {
+                MethodVisitor mv = super.visitMethod(access, mname, mdesc, sig, ex);
+                if (mname.startsWith("<")) return mv;      // <init>/<clinit>: no GL
+                final String ret = mdesc == null ? null : defaultReturn(mdesc);
+                if (ret == null) return mv;                // unknown type: leave as-is
+                guarded[0]++;
+                return new MethodVisitor(Opcodes.ASM5, mv) {
+                    @Override public void visitCode() {
+                        super.visitCode();
+                        mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                                "glCallGuard", "()Z", false);
+                        Label cont = new Label();
+                        mv.visitJumpInsn(Opcodes.IFEQ, cont);
+                        emitDefault(mv, ret);          // no-op for void
+                        mv.visitInsn(returnOpcode(ret));
+                        mv.visitLabel(cont);
+                    }
+                };
+            }
+        }, 0);
+        NexusPlugin.LOGGER.info("[xform] {} gl-guarded methods={}", cr.getClassName(), guarded[0]);
+        return guarded[0] > 0 ? cw.toByteArray() : in;
+    }
+
+    /** Default value token for a method descriptor's return type, or null. */
+    private static String defaultReturn(String mdesc) {
+        int i = mdesc.indexOf(')');
+        if (i < 0) return null;
+        String r = mdesc.substring(i + 1);
+        if (r.isEmpty()) return null;
+        switch (r.charAt(0)) {
+            case 'V': return "void";
+            case 'Z': case 'B': case 'C': case 'S': case 'I': return "int";
+            case 'J': return "long";
+            case 'F': return "float";
+            case 'D': return "double";
+            case 'L': case '[': return "null";
+            default: return null;
+        }
+    }
+
+    private static void emitDefault(MethodVisitor mv, String kind) {
+        if ("void".equals(kind)) return;                       // nothing to push
+        if ("int".equals(kind)) mv.visitInsn(Opcodes.ICONST_0);
+        else if ("long".equals(kind)) mv.visitInsn(Opcodes.LCONST_0);
+        else if ("float".equals(kind)) mv.visitInsn(Opcodes.FCONST_0);
+        else if ("double".equals(kind)) mv.visitInsn(Opcodes.DCONST_0);
+        else mv.visitInsn(Opcodes.ACONST_NULL);
+    }
+
+    private static int returnOpcode(String kind) {
+        if ("void".equals(kind)) return Opcodes.RETURN;
+        if ("int".equals(kind)) return Opcodes.IRETURN;
+        if ("long".equals(kind)) return Opcodes.LRETURN;
+        if ("float".equals(kind)) return Opcodes.FRETURN;
+        if ("double".equals(kind)) return Opcodes.DRETURN;
+        return Opcodes.ARETURN;
+    }
+
     /**
-     * Rewrites INVOKESTATIC Tessellator.getInstance() → NexusHooks.tessellatorForThread()
-     * inside a single method. Named static class (not an anonymous MethodVisitor)
-     * so its bytecode is resolved when NexusTransformer itself loads — an anonymous
-     * class first-instantiated *inside* transform() triggers a class load mid-
-     * transform and the JVM marks it ClassCircularityError, permanently breaking
-     * the redirect for every later class (the launch-log spam).
+     * Rewrite every INVOKESTATIC Tessellator.getInstance() call to
+     * NexusHooks.tessellatorForThread(), so a bound bot thread gets its own
+     * ThreadLocal Tessellator and two threads can never begin() the same
+     * BufferBuilder. Returns the rewritten bytes, or null when nothing matched.
+     *
+     * COMPUTE_MAXS, not COMPUTE_FRAMES: the rewrite swaps one INVOKESTATIC for
+     * another with the same return type, so the original frames stay valid.
+     * Recomputing them is actively harmful — this runs on obfuscated jars whose
+     * callers reference mcp-named types that are not on the transform-time
+     * classpath, so getCommonSuperClass falls back to Object and the emitted
+     * frame fails verification ("Bad type on operand stack", KillAuraHandler.f).
      */
+    /** Named static class, never anonymous — see the preload note above. */
     private static final class TessGetInsnVisitor extends MethodVisitor {
         private final int[] rewrites;
+        private final int[] windowRewrites;
 
-        TessGetInsnVisitor(MethodVisitor mv, int[] rewrites) {
+        TessGetInsnVisitor(MethodVisitor mv, int[] rewrites, int[] windowRewrites) {
             super(Opcodes.ASM5, mv);
             this.rewrites = rewrites;
+            this.windowRewrites = windowRewrites;
         }
 
         @Override
@@ -1326,6 +1512,69 @@ public class NexusTransformer implements IClassTransformer {
                 rewrites[0]++;
                 return;
             }
+            // ---- LWJGL window mutations: marshal to the client thread ----
+            //
+            // org.lwjgl.opengl.Display is loaded by sun.misc.Launcher$AppClassLoader,
+            // so no coremod ever sees it (verified via Instrumentation) — the call
+            // SITES are redirected to a NexusHooks.safeXxx hook instead. On the client
+            // thread the hook runs the original call unchanged; anywhere else it queues
+            // it and heartbeat() replays it next tick, FIFO. Mod-agnostic: covers
+            // DragonCore's setTitle and ol.m(int,int), MC's own window init and any
+            // future mod without patching anyone's jar. Rationale + measured
+            // HANG/THROW table live in NexusHooks.
+            if (opcode == Opcodes.INVOKESTATIC && "org/lwjgl/opengl/Display".equals(owner)) {
+                if (name.equals("setTitle") && desc.equals("(Ljava/lang/String;)V")) {
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                            "safeSetTitle", "(Ljava/lang/String;)V", false);
+                    windowRewrites[0]++;
+                    return;
+                }
+                if (name.equals("setLocation") && desc.equals("(II)V")) {
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                            "safeSetLocation", "(II)V", false);
+                    windowRewrites[0]++;
+                    return;
+                }
+                if (name.equals("setDisplayMode")
+                        && desc.equals("(Lorg/lwjgl/opengl/DisplayMode;)V")) {
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                            "safeSetDisplayMode", "(Ljava/lang/Object;)V", false);
+                    windowRewrites[0]++;
+                    return;
+                }
+                if (name.equals("setFullscreen") && desc.equals("(Z)V")) {
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                            "safeSetFullscreen", "(Z)V", false);
+                    windowRewrites[0]++;
+                    return;
+                }
+                if (name.equals("setResizable") && desc.equals("(Z)V")) {
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                            "safeSetResizable", "(Z)V", false);
+                    windowRewrites[0]++;
+                    return;
+                }
+                if (name.equals("setDisplayModeAndFullscreen")
+                        && desc.equals("(Lorg/lwjgl/opengl/DisplayMode;)V")) {
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                            "safeSetDisplayModeAndFullscreen",
+                            "(Ljava/lang/Object;)V", false);
+                    windowRewrites[0]++;
+                    return;
+                }
+                if (name.equals("setVSyncEnabled") && desc.equals("(Z)V")) {
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                            "safeSetVSyncEnabled", "(Z)V", false);
+                    windowRewrites[0]++;
+                    return;
+                }
+                if (name.equals("setSwapInterval") && desc.equals("(I)V")) {
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                            "safeSetSwapInterval", "(I)V", false);
+                    windowRewrites[0]++;
+                    return;
+                }
+            }
             super.visitMethodInsn(opcode, owner, name, desc, itf);
         }
     }
@@ -1333,17 +1582,19 @@ public class NexusTransformer implements IClassTransformer {
     /** ClassVisitor feeding {@link TessGetInsnVisitor} into every method. */
     private static final class TessGetClassVisitor extends ClassVisitor {
         private final int[] rewrites;
+        private final int[] windowRewrites;
 
-        TessGetClassVisitor(ClassWriter cw, int[] rewrites) {
+        TessGetClassVisitor(ClassWriter cw, int[] rewrites, int[] windowRewrites) {
             super(Opcodes.ASM5, cw);
             this.rewrites = rewrites;
+            this.windowRewrites = windowRewrites;
         }
 
         @Override
         public MethodVisitor visitMethod(int access, String mname, String mdesc,
                                          String sig, String[] ex) {
             MethodVisitor mv = super.visitMethod(access, mname, mdesc, sig, ex);
-            return new TessGetInsnVisitor(mv, rewrites);
+            return new TessGetInsnVisitor(mv, rewrites, windowRewrites);
         }
     }
 
@@ -1355,12 +1606,17 @@ public class NexusTransformer implements IClassTransformer {
         if (HOOKS_INTERNAL.equals(cr.getClassName())) return null;
         ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_MAXS);
         final int[] rewrites = {0};
-        cr.accept(new TessGetClassVisitor(cw, rewrites), 0);
+        final int[] windowRewrites = {0};
+        cr.accept(new TessGetClassVisitor(cw, rewrites, windowRewrites), 0);
         if (rewrites[0] > 0) {
             NexusPlugin.LOGGER.info("[xform] Tessellator.getInstance redirected x{} in {}",
                     rewrites[0], cr.getClassName());
         }
-        return rewrites[0] > 0 ? cw.toByteArray() : null;
+        if (windowRewrites[0] > 0) {
+            NexusPlugin.LOGGER.info("[xform] Display window ops marshalled x{} in {}",
+                    windowRewrites[0], cr.getClassName());
+        }
+        return (rewrites[0] > 0 || windowRewrites[0] > 0) ? cw.toByteArray() : null;
     }
     /**
      * Post-pass: run the Tessellator.getInstance() redirect over bytes that a
@@ -1531,12 +1787,10 @@ public class NexusTransformer implements IClassTransformer {
                         }
                     };
                 }
-                // func_78874_a / renderParticles — renders all particles, calls
-                // a mount window carry null world → NPE at Particle.java:344.
-                // func_78868_a / updateEffects — ticks all particles; the same
-                // null-world particle NPEs at ParticleManager.java:203 inside
-                // its private per-particle tick helper. Both entry points must
-                // be guarded; wrapping only one leaves the other to crash.
+                // renderParticles/updateEffects: a particle spawned during a mount
+                // window carries a null world and NPEs inside onUpdate (Particle.java
+                // :344, ParticleManager.java:203). Guard both entry points — wrapping
+                // only one leaves the other to crash.
                 if (("(Lnet/minecraft/entity/Entity;F)V".equals(mdesc) &&
                         (mname.equals("renderParticles") || mname.equals("func_78874_a")))
                     || ("(Lvg;F)V".equals(mdesc) && mname.equals("a"))
@@ -1643,6 +1897,59 @@ public class NexusTransformer implements IClassTransformer {
         // displayString (private, does the glClear) func_73722_d d(Ljava/lang/String;)V
         {"displayString", "func_73722_d", "d", "(Ljava/lang/String;)V"},
     };
+
+    /**
+     * TileEntityRendererDispatcher (bwx): head-guard the two render funnels so
+     * the prepare()-set state (world / entity / fontRenderer / renderEngine)
+     * is filled before a TESR reads it. Same failure mode as RenderManager:
+     * after a disconnect/reconnect, setWorld(null) nulls `entity`, and a mod
+     * rendering block entities from a HUD event before the next world pass
+     * NPEs in drawNameplate / sign text / getCombinedLight.
+     *   render(TileEntity,DDDFIF)V  func_192854_a  a(Lavj;DDDFIF)V — fill only
+     *   render(TileEntity,FI)V      func_180546_a  a(Lavj;FI)V     — fill, skip if world still null
+     */
+    private byte[] transformTileEntityDispatcher(byte[] in) {
+        ClassReader cr = new ClassReader(in);
+        ClassWriter cw = writer(cr);
+        final int[] patched = {0};
+        cr.accept(new ClassVisitor(Opcodes.ASM5, cw) {
+            @Override
+            public MethodVisitor visitMethod(int access, String mname, String mdesc,
+                                             String sig, String[] ex) {
+                MethodVisitor mv = super.visitMethod(access, mname, mdesc, sig, ex);
+                boolean nameOk = mname.equals("render") || mname.equals("a")
+                        || mname.equals("func_192854_a") || mname.equals("func_180546_a");
+                if (!nameOk) return mv;
+                final boolean full = "(Lnet/minecraft/tileentity/TileEntity;DDDFIF)V".equals(mdesc)
+                        || "(Lavj;DDDFIF)V".equals(mdesc);
+                final boolean lit = "(Lnet/minecraft/tileentity/TileEntity;FI)V".equals(mdesc)
+                        || "(Lavj;FI)V".equals(mdesc);
+                if (!full && !lit) return mv;
+                patched[0]++;
+                return new MethodVisitor(Opcodes.ASM5, mv) {
+                    @Override
+                    public void visitCode() {
+                        super.visitCode();
+                        mv.visitVarInsn(Opcodes.ALOAD, 0);          // this (TileEntityRendererDispatcher)
+                        if (full) {
+                            mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                                    "fillTileEntityRenderState", "(Ljava/lang/Object;)V", false);
+                        } else {
+                            mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS_INTERNAL,
+                                    "tileEntityWorldGuard", "(Ljava/lang/Object;)Z", false);
+                            Label cont = new Label();
+                            mv.visitJumpInsn(Opcodes.IFEQ, cont);
+                            mv.visitInsn(Opcodes.RETURN);
+                            mv.visitLabel(cont);
+                        }
+                    }
+                };
+            }
+        }, 0);
+        if (patched[0] < 2) NexusPlugin.LOGGER.warn("TileEntityRendererDispatcher.render guarded={} (expected 2)", patched[0]);
+        else NexusPlugin.LOGGER.info("[xform] TileEntityRendererDispatcher.render guarded={}", patched[0]);
+        return patched[0] > 0 ? cw.toByteArray() : in;
+    }
 
     /** TileEntityRendererDispatcher (bwx): setWorld mutates shared `instance`. */
     private static final String[][] TER_METHODS = {

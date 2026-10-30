@@ -87,6 +87,10 @@ final class NexusCommands {
             case Keyboard.KEY_SPACE: return "Space";
             case Keyboard.KEY_ESCAPE: return "Esc";
             case Keyboard.KEY_TAB: return "Tab";
+            case Keyboard.KEY_EQUALS: return "=";
+            case Keyboard.KEY_MINUS: return "-";
+            case Keyboard.KEY_ADD: return "小键盘 +";
+            case Keyboard.KEY_SUBTRACT: return "小键盘 -";
             default:
                 String n = Keyboard.getKeyName(key);
                 return n == null ? "#" + key : n;
@@ -132,6 +136,18 @@ final class NexusCommands {
                 NexusScreen::toggleRightPanel, ctrl(Keyboard.KEY_B)));
         l.add(new Cmd("close", "关闭管理器", "通用", "关闭 Nexus 界面 (Esc 也可)",
                 NexusScreen::requestClose));
+
+        // 连续百分比缩放：每次 5%，按住连续，范围 50% ~ 300%
+        l.add(new Cmd("ui.zoomIn", "放大界面", "视图", "整体文字与布局 +5%，按住连续 (Ctrl + + / Ctrl + 滚轮)",
+                s -> s.zoomBy(1), ctrl(Keyboard.KEY_EQUALS), ctrlShift(Keyboard.KEY_EQUALS),
+                ctrl(Keyboard.KEY_ADD)));
+        l.add(new Cmd("ui.zoomOut", "缩小界面", "视图", "整体文字与布局 -5%，按住连续 (Ctrl + - / Ctrl + 滚轮)",
+                s -> s.zoomBy(-1), ctrl(Keyboard.KEY_MINUS), ctrl(Keyboard.KEY_SUBTRACT)));
+        l.add(new Cmd("ui.zoomReset", "重置界面大小", "视图", "恢复 100% 设计基准 (Ctrl + 0)",
+                NexusScreen::resetZoom, ctrl(Keyboard.KEY_0)));
+        l.add(new Cmd("ui.hdFont", "切换高清字体", "视图",
+                "开/关字形图集高清字体（关闭后重新打开界面生效；缩放非整数比例时原版字体会糊）",
+                NexusScreen::toggleHdFont));
 
         l.add(new Cmd("selall", "全选当前页", "账号", "选中当前筛选下全部账号",
                 NexusScreen::selectAllFiltered, ctrl(Keyboard.KEY_A)));

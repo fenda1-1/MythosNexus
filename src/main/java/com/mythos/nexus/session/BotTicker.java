@@ -6,11 +6,6 @@ import com.mythos.nexus.core.NexusPlugin;
 /**
  * The dedicated tick worker for ONE background bot session.
  *
- * Replaces the serial per-session slice SessionTicker used to run on the
- * client thread. The worker runs on its own thread so a bot's
- * world.tick + packet dispatch + MythosScript hooks execute concurrently
- * with the mounted session's render loop — the entire point of the
- * parallel-tick refactor.
  *
  * Thread model:
  *   - started lazily the first time a session goes ONLINE with a world;
@@ -48,7 +43,7 @@ final class BotTicker implements Runnable {
         NexusCtx.bind(session);
         try {
             NexusLog.session("[ticker] start {}", session.username);
-            while (keepRunning() && !session.tickerStopRequested()) {
+            while (keepRunning() && owned()) {
                 long start = System.nanoTime();
                 try {
                     tickOnce();
@@ -82,12 +77,25 @@ final class BotTicker implements Runnable {
                     || session.state == BotSession.State.ONLINE);
     }
 
+    /** True while this thread is still the session's registered worker.
+     *  stopTicker() clears session.ticker and ensureTicker() replaces it, and
+     *  ensureTicker() resets tickerStopRequested for the new worker — so the
+     *  flag alone cannot stop a lingering old worker; the identity check can. */
+    private boolean owned() {
+        return session.ticker == Thread.currentThread() && !session.tickerStopRequested();
+    }
+
+    /** Checked between tick phases and before every hook: once the session is
+     *  mounted (the client thread now drives it) or this worker was stopped,
+     *  nothing more may touch its player/world from this thread. */
+    private boolean yielded(SessionManager mgr) {
+        return !owned() || mgr.isForeground(session);
+    }
+
     /**
-     * One tick slice — the set of work SessionTicker used to run per session.
-     * Everything here executes inside the bound NexusCtx, so mc.player /
-     * mc.world / mc.playerController / currentScreen reads inside
-     * tick-reachable (rewritten) classes resolve to THIS session, never the
-     * mounted one.
+     * One tick slice, running inside this session's bound NexusCtx — so mc.player /
+     * mc.world / mc.playerController / currentScreen reads inside rewritten
+     * classes resolve to THIS session, never the mounted one.
      */
     private void tickOnce() {
         final BotSession ctx = session;
@@ -96,9 +104,10 @@ final class BotTicker implements Runnable {
         // If this session became mounted while we were mid-tick, stop — the
         // client thread owns mounted-session ticks and double-ticking a live
         // world corrupts it.
-        if (mgr.isForeground(ctx)) return;
+        if (yielded(mgr)) return;
 
         PacketPump.pumpFor(ctx);
+        if (yielded(mgr)) return;
 
         // These were enqueued by foreign threads and MUST run here on the
         // session's own tick thread — running them inline on an MCP pool
@@ -106,6 +115,7 @@ final class BotTicker implements Runnable {
         // Manager / feature managers and produced ConcurrentModification
         // Exception. Serializing on the tick thread restores the invariant.
         ctx.drainTasks();
+        if (yielded(mgr)) return;
 
         // Per-bot override wins; otherwise idle bots (no active path) drop to
         // the global idle rate so parked sessions don't burn a full 20 TPS
@@ -145,7 +155,11 @@ final class BotTicker implements Runnable {
             ctx.tickRateAcc = 0;
         }
 
-        for (Runnable hook : SessionTicker.FAST_HOOKS) hook.run();
+        for (Runnable hook : SessionTicker.FAST_HOOKS) {
+            if (yielded(mgr)) return;
+            hook.run();
+        }
+        if (yielded(mgr)) return;
 
         antiIdle(ctx);
 
@@ -162,7 +176,7 @@ final class BotTicker implements Runnable {
         // are mid-swap here (the mount switch crash left the shared Tessellator
         // in "Already building!" state from a bot render racing the swap).
         if (runFullTick && ctx.world != null
-                && !SessionManager.isMountInProgress()) {
+                && !SessionManager.isMountInProgress() && !yielded(mgr)) {
             try {
                 // Strip MovementInputFromOptions — it reads shared keybinds and
                 // would steer every background bot along with whoever is
@@ -213,7 +227,10 @@ final class BotTicker implements Runnable {
                         ctx.username, t);
             }
             // MythosScript hooks — ran only on a full (gated) tick.
-            for (Runnable hook : SessionTicker.TICK_HOOKS) hook.run();
+            for (Runnable hook : SessionTicker.TICK_HOOKS) {
+                if (yielded(mgr) || SessionManager.isMountInProgress()) return;
+                hook.run();
+            }
         }
     }
 

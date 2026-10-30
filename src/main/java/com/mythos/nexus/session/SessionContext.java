@@ -10,12 +10,10 @@ import net.minecraft.client.network.NetHandlerPlayClient;
 import java.lang.reflect.Field;
 
 /**
- * The mount-context machinery for one BotSession: the reflective field
- * handles into the Minecraft singleton, the saved prev* snapshot, and the
- * push/pop pair that swaps this session's world/player/controller/screen in
- * and out while packets dispatch or the session mounts. Extracted from
- * BotSession — session state (world/player/etc.) stays there; this class
- * only moves it in and out of the singleton.
+ * The mount-context machinery for one BotSession: reflective handles into the
+ * Minecraft singleton, the saved prev* snapshot, and the push/pop pair that
+ * moves this session's world/player/controller/screen in and out of it.
+ * Session state itself stays in BotSession.
  */
 public class SessionContext {
 
@@ -134,21 +132,15 @@ public class SessionContext {
             fPlayer.set(mc, s.player);
             fController.set(mc, s.playerController);
             fViewEntity.set(mc, s.player);
-            // Do NOT swap mc.currentScreen here — it's only meaningful for
-            // the mounted session, and pushing a stale savedScreen into the
-            // singleton while a background packet is dispatching lets
-            // displayGuiScreen(null) inside SPacketJoinGame permanently wipe
-            // the mounted session's GUI on pop-restore. Background sessions
-            // simply leave mc.currentScreen alone; their own screens live in
-            // savedScreen until they mount.
-            // Packet handlers reach renderGlobal (playEvent/particles/block
-            // updates) — its private `world` must not be null or the wrong
-            // session's while this session dispatches.
-            // RenderGlobal owns the foreground world's chunk renderers. A
-            // background bot has no matching renderer resources, so pointing
-            // this shared object at its world makes block packets throw NPEs
-            // and drops later position corrections. Only the mounted session
-            // may change it.
+            // mc.currentScreen stays untouched: it belongs to the mounted
+            // session, and pushing a stale savedScreen in while a background
+            // packet dispatches lets displayGuiScreen(null) from JoinGame wipe
+            // the user's GUI on pop-restore. Background sessions keep their own
+            // screens in savedScreen until they mount.
+            // renderGlobal is different: its private `world` must be live during
+            // dispatch (block/particle/playEvent handlers read it), yet it owns
+            // the foreground chunk renderers, so only the mounted session may
+            // repoint it.
             if (s.world != null && mc.renderGlobal != null
                     && s == SessionManager.get().mounted())
                 fRgWorld.set(mc.renderGlobal, s.world);
@@ -553,17 +545,10 @@ public class SessionContext {
             Object w = fWorld.get(mc);
             Object p = fPlayer.get(mc);
             Object c = fController.get(mc);
-            // Only absorb the live singleton when it still holds OUR entity.
-            // During a mount handoff the caller sequence (unmount→capture→
-            // persist) can run this while mc.player already belongs to the
-            // incoming session — storing it rebinds this session's ctx.player
-            // to a foreign entity and baritone pathfinds the wrong body
-            // (the "human walks off-route after mounting a bot" bug).
-            // Absorb when the singleton still holds OUR entity, or when it's
-            // null (disconnect — clear the field). Refuse a foreign entity:
-            // during mount handoff mc.player can already be the incoming
-            // session's; storing that rebinds ctx.player to the wrong body
-            // and baritone pathfinds it instead of ours.
+            // Absorb only when the singleton still holds OUR entity (or null,
+            // i.e. disconnect). During a mount handoff mc.player may already be
+            // the incoming session's, and storing it rebinds ctx.player to a
+            // foreign body — baritone then pathfinds it instead of ours.
             boolean absorb = p == null
                     || s == SessionManager.get().humanSession()   // human owns whatever the singleton holds
                     || (p instanceof EntityPlayerSP && s.username != null

@@ -62,6 +62,8 @@ public final class NexusRefs {
             MYTHOS + ".handlers.ConditionalExecutionHandler";
     public static final String AUTO_ESCAPE_HANDLER      = MYTHOS + ".handlers.AutoEscapeHandler";
     public static final String AUTO_FOLLOW_HANDLER      = MYTHOS + ".handlers.AutoFollowHandler";
+    public static final String AUTO_USE_ITEM_HANDLER    = MYTHOS + ".handlers.AutoUseItemHandler";
+    public static final String BARITONE_PARKOUR_HELPER  = MYTHOS + ".config.BaritoneParkourSettingsHelper";
     public static final String EMBEDDED_NAVIGATION_HANDLER =
             MYTHOS + ".handlers.EmbeddedNavigationHandler";
     public static final String SPEED_HANDLER =
